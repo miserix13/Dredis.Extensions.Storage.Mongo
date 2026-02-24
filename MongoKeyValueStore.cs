@@ -22,6 +22,7 @@ namespace Dredis.Extensions.Storage.Mongo
     private readonly IMongoCollection<CuckooDocument> cuckooCollection;
     private readonly IMongoCollection<TDigestDocument> tdigestCollection;
     private readonly IMongoCollection<TopKDocument> topKCollection;
+    private readonly IMongoCollection<VectorDocument> vectorCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -37,6 +38,7 @@ namespace Dredis.Extensions.Storage.Mongo
             this.cuckooCollection = this.database.GetCollection<CuckooDocument>($"{collectionName ?? "kvstore"}_cuckoo");
             this.tdigestCollection = this.database.GetCollection<TDigestDocument>($"{collectionName ?? "kvstore"}_tdigest");
             this.topKCollection = this.database.GetCollection<TopKDocument>($"{collectionName ?? "kvstore"}_topk");
+            this.vectorCollection = this.database.GetCollection<VectorDocument>($"{collectionName ?? "kvstore"}_vector");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -82,6 +84,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var topkKeyIndexModel = new CreateIndexModel<TopKDocument>(topkKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.topKCollection.Indexes.CreateOne(topkKeyIndexModel);
 
+            var vectorKeyIndexKeys = Builders<VectorDocument>.IndexKeys.Ascending(x => x.Key);
+            var vectorKeyIndexModel = new CreateIndexModel<VectorDocument>(vectorKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.vectorCollection.Indexes.CreateOne(vectorKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -126,6 +132,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var topkTtlIndexKeys = Builders<TopKDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var topkTtlIndexModel = new CreateIndexModel<TopKDocument>(topkTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.topKCollection.Indexes.CreateOne(topkTtlIndexModel);
+
+            var vectorTtlIndexKeys = Builders<VectorDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var vectorTtlIndexModel = new CreateIndexModel<VectorDocument>(vectorTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.vectorCollection.Indexes.CreateOne(vectorTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -304,6 +314,14 @@ namespace Dredis.Extensions.Storage.Mongo
             public DateTime? ExpireAt { get; set; }
         }
 
+        private class VectorDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public double[] Vector { get; set; } = Array.Empty<double>();
+            public DateTime? ExpireAt { get; set; }
+        }
+
         private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
 
         private static FilterDefinition<KeyValueDocument> ActiveFilter(DateTime nowUtc) =>
@@ -464,6 +482,21 @@ namespace Dredis.Extensions.Storage.Mongo
                 Builders<TopKDocument>.Filter.In(x => x.Key, keys),
                 ActiveTopKFilter(nowUtc));
 
+        private FilterDefinition<VectorDocument> VectorKeyFilter(string key) => Builders<VectorDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<VectorDocument> ActiveVectorFilter(DateTime nowUtc) =>
+            Builders<VectorDocument>.Filter.Or(
+                Builders<VectorDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<VectorDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<VectorDocument> ActiveVectorKeyFilter(string key, DateTime nowUtc) =>
+            Builders<VectorDocument>.Filter.And(VectorKeyFilter(key), ActiveVectorFilter(nowUtc));
+
+        private FilterDefinition<VectorDocument> ActiveVectorKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<VectorDocument>.Filter.And(
+                Builders<VectorDocument>.Filter.In(x => x.Key, keys),
+                ActiveVectorFilter(nowUtc));
+
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
                 Builders<HashDocument>.Filter.In(x => x.Key, keys),
@@ -549,7 +582,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var tdigestResult = await tdigestCollection.DeleteManyAsync(tdigestFilter, token);
             var topkFilter = Builders<TopKDocument>.Filter.In(x => x.Key, keys);
             var topkResult = await topKCollection.DeleteManyAsync(topkFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount;
+            var vectorFilter = Builders<VectorDocument>.Filter.In(x => x.Key, keys);
+            var vectorResult = await vectorCollection.DeleteManyAsync(vectorFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -615,7 +650,13 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            var topkCount = await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token);
+            if (topkCount > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -694,6 +735,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var vectorKeys = await vectorCollection.Find(ActiveVectorKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in vectorKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -714,6 +761,7 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await cuckooCollection.DeleteOneAsync(ActiveCuckooKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await tdigestCollection.DeleteOneAsync(ActiveTDigestKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await topKCollection.DeleteOneAsync(ActiveTopKKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await vectorCollection.DeleteOneAsync(ActiveVectorKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -802,7 +850,15 @@ namespace Dredis.Extensions.Storage.Mongo
             var topkFilter = ActiveTopKKeyFilter(key, nowUtc);
             var topkUpdate = Builders<TopKDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var topkResult = await topKCollection.UpdateOneAsync(topkFilter, topkUpdate, null, token);
-            return topkResult.MatchedCount > 0;
+            if (topkResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var vectorFilter = ActiveVectorKeyFilter(key, nowUtc);
+            var vectorUpdate = Builders<VectorDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var vectorResult = await vectorCollection.UpdateOneAsync(vectorFilter, vectorUpdate, null, token);
+            return vectorResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -1352,32 +1408,32 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<VectorDeleteResult> VectorDeleteAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return VectorDeleteCoreAsync(key, token);
         }
 
         public Task<VectorGetResult> VectorGetAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return VectorGetCoreAsync(key, token);
         }
 
         public Task<VectorSearchResult> VectorSearchAsync(string keyPrefix, int topK, int offset, string metric, double[] queryVector, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return VectorSearchCoreAsync(keyPrefix, topK, offset, metric, queryVector, token);
         }
 
         public Task<VectorSetResult> VectorSetAsync(string key, double[] vector, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return VectorSetCoreAsync(key, vector, token);
         }
 
         public Task<VectorSimilarityResult> VectorSimilarityAsync(string key, string otherKey, string metric, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return VectorSimilarityCoreAsync(key, otherKey, metric, token);
         }
 
         public Task<VectorSizeResult> VectorSizeAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return VectorSizeCoreAsync(key, token);
         }
 
         private async Task<long> CleanUpExpiredKeysCoreAsync(CancellationToken token)
@@ -1405,7 +1461,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var tdigestResult = await tdigestCollection.DeleteManyAsync(tdigestFilter, token);
             var topkFilter = Builders<TopKDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var topkResult = await topKCollection.DeleteManyAsync(topkFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount;
+            var vectorFilter = Builders<VectorDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var vectorResult = await vectorCollection.DeleteManyAsync(vectorFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -1643,6 +1701,23 @@ namespace Dredis.Extensions.Storage.Mongo
                 return (long)(topkDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
+            var vectorDoc = await vectorCollection.Find(VectorKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (vectorDoc != null)
+            {
+                if (!vectorDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (vectorDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await vectorCollection.DeleteOneAsync(VectorKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(vectorDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
             return -2;
         }
 
@@ -1669,7 +1744,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0 ||
                 await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0 ||
                 await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0 ||
-                await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+                await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0 ||
+                await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1898,7 +1974,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
@@ -2039,7 +2120,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsSortedSetWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2089,7 +2175,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static bool TryParseStreamId(string id, out long milliseconds, out long sequence)
@@ -2235,7 +2326,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsHyperLogLogWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2285,7 +2381,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsBloomWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2335,7 +2436,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsCuckooWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2385,7 +2491,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsTDigestWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2435,7 +2546,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsTopKWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2485,7 +2601,67 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsVectorWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<HyperLogLogAddResult> HyperLogLogAddCoreAsync(string key, byte[][] elements, CancellationToken token)
@@ -3551,6 +3727,201 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             return output;
+        }
+
+        private async Task<VectorSetResult> VectorSetCoreAsync(string key, double[] vector, CancellationToken token)
+        {
+            if (vector.Length == 0 || !IsValidFiniteVector(vector))
+            {
+                return new VectorSetResult(VectorResultStatus.InvalidArgument);
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsVectorWrongTypeAsync(key, nowUtc, token))
+            {
+                return new VectorSetResult(VectorResultStatus.WrongType);
+            }
+
+            var update = Builders<VectorDocument>.Update
+                .Set(x => x.Key, key)
+                .Set(x => x.Vector, vector)
+                .SetOnInsert(x => x.ExpireAt, (DateTime?)null);
+            await vectorCollection.UpdateOneAsync(VectorKeyFilter(key), update, new UpdateOptions { IsUpsert = true }, token);
+            return new VectorSetResult(VectorResultStatus.Ok);
+        }
+
+        private async Task<VectorGetResult> VectorGetCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsVectorWrongTypeAsync(key, nowUtc, token))
+            {
+                return new VectorGetResult(VectorResultStatus.WrongType, null);
+            }
+
+            var doc = await vectorCollection.Find(ActiveVectorKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new VectorGetResult(VectorResultStatus.NotFound, null);
+            }
+
+            return new VectorGetResult(VectorResultStatus.Ok, doc.Vector);
+        }
+
+        private async Task<VectorSizeResult> VectorSizeCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsVectorWrongTypeAsync(key, nowUtc, token))
+            {
+                return new VectorSizeResult(VectorResultStatus.WrongType, 0);
+            }
+
+            var doc = await vectorCollection.Find(ActiveVectorKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new VectorSizeResult(VectorResultStatus.NotFound, 0);
+            }
+
+            return new VectorSizeResult(VectorResultStatus.Ok, doc.Vector.LongLength);
+        }
+
+        private async Task<VectorDeleteResult> VectorDeleteCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsVectorWrongTypeAsync(key, nowUtc, token))
+            {
+                return new VectorDeleteResult(VectorResultStatus.WrongType, 0);
+            }
+
+            var deleted = (await vectorCollection.DeleteOneAsync(ActiveVectorKeyFilter(key, nowUtc), token)).DeletedCount;
+            return new VectorDeleteResult(VectorResultStatus.Ok, deleted);
+        }
+
+        private async Task<VectorSimilarityResult> VectorSimilarityCoreAsync(string key, string otherKey, string metric, CancellationToken token)
+        {
+            if (!TryNormalizeVectorMetric(metric, out var normalizedMetric))
+            {
+                return new VectorSimilarityResult(VectorResultStatus.InvalidArgument, null);
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsVectorWrongTypeAsync(key, nowUtc, token) || await IsVectorWrongTypeAsync(otherKey, nowUtc, token))
+            {
+                return new VectorSimilarityResult(VectorResultStatus.WrongType, null);
+            }
+
+            var first = await vectorCollection.Find(ActiveVectorKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            var second = await vectorCollection.Find(ActiveVectorKeyFilter(otherKey, nowUtc)).FirstOrDefaultAsync(token);
+            if (first == null || second == null)
+            {
+                return new VectorSimilarityResult(VectorResultStatus.NotFound, null);
+            }
+
+            if (first.Vector.Length != second.Vector.Length || first.Vector.Length == 0)
+            {
+                return new VectorSimilarityResult(VectorResultStatus.InvalidArgument, null);
+            }
+
+            var value = ComputeVectorScore(first.Vector, second.Vector, normalizedMetric, out var valid);
+            if (!valid)
+            {
+                return new VectorSimilarityResult(VectorResultStatus.InvalidArgument, null);
+            }
+
+            return new VectorSimilarityResult(VectorResultStatus.Ok, value);
+        }
+
+        private async Task<VectorSearchResult> VectorSearchCoreAsync(string keyPrefix, int topK, int offset, string metric, double[] queryVector, CancellationToken token)
+        {
+            if (topK <= 0 || offset < 0 || queryVector.Length == 0 || !IsValidFiniteVector(queryVector) || !TryNormalizeVectorMetric(metric, out var normalizedMetric))
+            {
+                return new VectorSearchResult(VectorResultStatus.InvalidArgument, Array.Empty<VectorSearchEntry>());
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            var docs = await vectorCollection.Find(ActiveVectorFilter(nowUtc)).ToListAsync(token);
+            var filtered = docs.Where(x => x.Key.StartsWith(keyPrefix, StringComparison.Ordinal));
+
+            var entries = new List<VectorSearchEntry>();
+            foreach (var doc in filtered)
+            {
+                if (doc.Vector.Length != queryVector.Length || doc.Vector.Length == 0)
+                {
+                    continue;
+                }
+
+                var score = ComputeVectorScore(queryVector, doc.Vector, normalizedMetric, out var valid);
+                if (!valid)
+                {
+                    continue;
+                }
+
+                entries.Add(new VectorSearchEntry(doc.Key, score));
+            }
+
+            IEnumerable<VectorSearchEntry> ordered = normalizedMetric == "L2"
+                ? entries.OrderBy(x => x.Score).ThenBy(x => x.Key, StringComparer.Ordinal)
+                : entries.OrderByDescending(x => x.Score).ThenBy(x => x.Key, StringComparer.Ordinal);
+
+            var paged = ordered.Skip(offset).Take(topK).ToArray();
+            return new VectorSearchResult(VectorResultStatus.Ok, paged);
+        }
+
+        private static bool TryNormalizeVectorMetric(string metric, out string normalizedMetric)
+        {
+            normalizedMetric = (metric ?? string.Empty).Trim().ToUpperInvariant();
+            return normalizedMetric is "COSINE" or "DOT" or "L2";
+        }
+
+        private static bool IsValidFiniteVector(double[] vector)
+        {
+            for (int i = 0; i < vector.Length; i++)
+            {
+                if (double.IsNaN(vector[i]) || double.IsInfinity(vector[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static double ComputeVectorScore(double[] left, double[] right, string metric, out bool valid)
+        {
+            valid = true;
+            var dot = 0.0;
+            var leftNormSquared = 0.0;
+            var rightNormSquared = 0.0;
+            var l2Squared = 0.0;
+
+            for (int i = 0; i < left.Length; i++)
+            {
+                var l = left[i];
+                var r = right[i];
+                dot += l * r;
+                leftNormSquared += l * l;
+                rightNormSquared += r * r;
+                var diff = l - r;
+                l2Squared += diff * diff;
+            }
+
+            if (metric == "DOT")
+            {
+                return dot;
+            }
+
+            if (metric == "L2")
+            {
+                return Math.Sqrt(l2Squared);
+            }
+
+            var denom = Math.Sqrt(leftNormSquared) * Math.Sqrt(rightNormSquared);
+            if (denom <= 0)
+            {
+                valid = false;
+                return 0;
+            }
+
+            return dot / denom;
         }
 
         private static double ComputeQuantile(List<double> values, double quantile)
