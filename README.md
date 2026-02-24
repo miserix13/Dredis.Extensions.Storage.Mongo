@@ -41,8 +41,28 @@ This package currently implements the following `IKeyValueStore` areas:
   - `ZRANGEBYSCORE`, `ZINCRBY`, `ZCOUNT`
   - `ZRANK`, `ZREVRANK`, `ZREMRANGEBYSCORE`
 
+## Quick start
+
+```csharp
+using Dredis.Abstractions.Storage;
+using Dredis.Extensions.Storage.Mongo;
+using MongoDB.Driver;
+
+var client = new MongoClient("mongodb://localhost:27017");
+IKeyValueStore store = new MongoKeyValueStore(client, "dredis", "kvstore");
+
+await store.SetAsync("hello", System.Text.Encoding.UTF8.GetBytes("world"), null, SetCondition.None);
+var value = await store.GetAsync("hello");
+```
+
 ## Notes
 
 - Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
 - Remaining `IKeyValueStore` areas (Streams, JSON, Probabilistic structures, Vector, TimeSeries, TopK, TDigest, etc.) are still pending.
+
+## Third-party notice
+
+- This project depends on the MongoDB .NET/C# Driver (`MongoDB.Driver`).
+- MongoDB is a registered trademark of MongoDB, Inc.
+- Copyright for MongoDB and the MongoDB .NET/C# Driver belongs to MongoDB, Inc.; see the package license terms for full details.
