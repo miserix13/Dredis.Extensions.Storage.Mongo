@@ -13,6 +13,8 @@ namespace Dredis.Extensions.Storage.Mongo
         private readonly IMongoCollection<KeyValueDocument> collection;
     private readonly IMongoCollection<HashDocument> hashCollection;
     private readonly IMongoCollection<ListDocument> listCollection;
+    private readonly IMongoCollection<SetDocument> setCollection;
+    private readonly IMongoCollection<SortedSetDocument> sortedSetCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -20,6 +22,8 @@ namespace Dredis.Extensions.Storage.Mongo
             this.collection = this.database.GetCollection<KeyValueDocument>(collectionName ?? "kvstore");
             this.hashCollection = this.database.GetCollection<HashDocument>($"{collectionName ?? "kvstore"}_hash");
             this.listCollection = this.database.GetCollection<ListDocument>($"{collectionName ?? "kvstore"}_list");
+            this.setCollection = this.database.GetCollection<SetDocument>($"{collectionName ?? "kvstore"}_set");
+            this.sortedSetCollection = this.database.GetCollection<SortedSetDocument>($"{collectionName ?? "kvstore"}_zset");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -33,6 +37,14 @@ namespace Dredis.Extensions.Storage.Mongo
             var listKeyIndexModel = new CreateIndexModel<ListDocument>(listKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.listCollection.Indexes.CreateOne(listKeyIndexModel);
 
+            var setKeyIndexKeys = Builders<SetDocument>.IndexKeys.Ascending(x => x.Key);
+            var setKeyIndexModel = new CreateIndexModel<SetDocument>(setKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.setCollection.Indexes.CreateOne(setKeyIndexModel);
+
+            var sortedSetKeyIndexKeys = Builders<SortedSetDocument>.IndexKeys.Ascending(x => x.Key);
+            var sortedSetKeyIndexModel = new CreateIndexModel<SortedSetDocument>(sortedSetKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.sortedSetCollection.Indexes.CreateOne(sortedSetKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -45,6 +57,14 @@ namespace Dredis.Extensions.Storage.Mongo
             var listTtlIndexKeys = Builders<ListDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var listTtlIndexModel = new CreateIndexModel<ListDocument>(listTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.listCollection.Indexes.CreateOne(listTtlIndexModel);
+
+            var setTtlIndexKeys = Builders<SetDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var setTtlIndexModel = new CreateIndexModel<SetDocument>(setTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.setCollection.Indexes.CreateOne(setTtlIndexModel);
+
+            var sortedSetTtlIndexKeys = Builders<SortedSetDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var sortedSetTtlIndexModel = new CreateIndexModel<SortedSetDocument>(sortedSetTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.sortedSetCollection.Indexes.CreateOne(sortedSetTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -74,6 +94,35 @@ namespace Dredis.Extensions.Storage.Mongo
             public ObjectId Id { get; set; }
             public string Key { get; set; } = null!;
             public List<byte[]> Values { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
+        private class SetMemberDocument
+        {
+            public string MemberKey { get; set; } = null!;
+            public byte[] Member { get; set; } = null!;
+        }
+
+        private class SetDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public List<SetMemberDocument> Members { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
+        private class SortedSetMemberDocument
+        {
+            public string MemberKey { get; set; } = null!;
+            public byte[] Member { get; set; } = null!;
+            public double Score { get; set; }
+        }
+
+        private class SortedSetDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public List<SortedSetMemberDocument> Members { get; set; } = new();
             public DateTime? ExpireAt { get; set; }
         }
 
@@ -116,6 +165,36 @@ namespace Dredis.Extensions.Storage.Mongo
             Builders<ListDocument>.Filter.And(
                 Builders<ListDocument>.Filter.In(x => x.Key, keys),
                 ActiveListFilter(nowUtc));
+
+        private FilterDefinition<SetDocument> SetKeyFilter(string key) => Builders<SetDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<SetDocument> ActiveSetFilter(DateTime nowUtc) =>
+            Builders<SetDocument>.Filter.Or(
+                Builders<SetDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<SetDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<SetDocument> ActiveSetKeyFilter(string key, DateTime nowUtc) =>
+            Builders<SetDocument>.Filter.And(SetKeyFilter(key), ActiveSetFilter(nowUtc));
+
+        private FilterDefinition<SetDocument> ActiveSetKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<SetDocument>.Filter.And(
+                Builders<SetDocument>.Filter.In(x => x.Key, keys),
+                ActiveSetFilter(nowUtc));
+
+        private FilterDefinition<SortedSetDocument> SortedSetKeyFilter(string key) => Builders<SortedSetDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<SortedSetDocument> ActiveSortedSetFilter(DateTime nowUtc) =>
+            Builders<SortedSetDocument>.Filter.Or(
+                Builders<SortedSetDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<SortedSetDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<SortedSetDocument> ActiveSortedSetKeyFilter(string key, DateTime nowUtc) =>
+            Builders<SortedSetDocument>.Filter.And(SortedSetKeyFilter(key), ActiveSortedSetFilter(nowUtc));
+
+        private FilterDefinition<SortedSetDocument> ActiveSortedSetKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<SortedSetDocument>.Filter.And(
+                Builders<SortedSetDocument>.Filter.In(x => x.Key, keys),
+                ActiveSortedSetFilter(nowUtc));
 
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
@@ -186,7 +265,11 @@ namespace Dredis.Extensions.Storage.Mongo
             var hashResult = await hashCollection.DeleteManyAsync(hashFilter, token);
             var listFilter = Builders<ListDocument>.Filter.In(x => x.Key, keys);
             var listResult = await listCollection.DeleteManyAsync(listFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount;
+            var setFilter = Builders<SetDocument>.Filter.In(x => x.Key, keys);
+            var setResult = await setCollection.DeleteManyAsync(setFilter, token);
+            var sortedSetFilter = Builders<SortedSetDocument>.Filter.In(x => x.Key, keys);
+            var sortedSetResult = await sortedSetCollection.DeleteManyAsync(sortedSetFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -205,7 +288,19 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var listCount = await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token);
-            return listCount > 0;
+            if (listCount > 0)
+            {
+                return true;
+            }
+
+            var setCount = await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token);
+            if (setCount > 0)
+            {
+                return true;
+            }
+
+            var sortedSetCount = await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token);
+            return sortedSetCount > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -236,6 +331,18 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var setKeys = await setCollection.Find(ActiveSetKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in setKeys)
+            {
+                keySet.Add(item);
+            }
+
+            var sortedSetKeys = await sortedSetCollection.Find(ActiveSortedSetKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in sortedSetKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -248,6 +355,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await collection.DeleteOneAsync(ActiveKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await hashCollection.DeleteOneAsync(ActiveHashKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await listCollection.DeleteOneAsync(ActiveListKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await setCollection.DeleteOneAsync(ActiveSetKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await sortedSetCollection.DeleteOneAsync(ActiveSortedSetKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -272,7 +381,23 @@ namespace Dredis.Extensions.Storage.Mongo
             var listFilter = ActiveListKeyFilter(key, nowUtc);
             var listUpdate = Builders<ListDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var listResult = await listCollection.UpdateOneAsync(listFilter, listUpdate, null, token);
-            return listResult.MatchedCount > 0;
+            if (listResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var setFilter = ActiveSetKeyFilter(key, nowUtc);
+            var setUpdate = Builders<SetDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var setResult = await setCollection.UpdateOneAsync(setFilter, setUpdate, null, token);
+            if (setResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var sortedSetFilter = ActiveSortedSetKeyFilter(key, nowUtc);
+            var sortedSetUpdate = Builders<SortedSetDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var sortedSetResult = await sortedSetCollection.UpdateOneAsync(sortedSetFilter, sortedSetUpdate, null, token);
+            return sortedSetResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -497,12 +622,12 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<SetCountResult> SetAddAsync(string key, byte[][] members, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SetAddCoreAsync(key, members, token);
         }
 
         public Task<SetCountResult> SetCardinalityAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SetCardinalityCoreAsync(key, token);
         }
 
         public Task<bool> SetManyAsync(KeyValuePair<string, byte[]>[] items, CancellationToken token = default)
@@ -512,67 +637,67 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<SetMembersResult> SetMembersAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SetMembersCoreAsync(key, token);
         }
 
         public Task<SetCountResult> SetRemoveAsync(string key, byte[][] members, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SetRemoveCoreAsync(key, members, token);
         }
 
         public Task<SortedSetCountResult> SortedSetAddAsync(string key, SortedSetEntry[] entries, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetAddCoreAsync(key, entries, token);
         }
 
         public Task<SortedSetCountResult> SortedSetCardinalityAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetCardinalityCoreAsync(key, token);
         }
 
         public Task<SortedSetCountResult> SortedSetCountByScoreAsync(string key, double minScore, double maxScore, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetCountByScoreCoreAsync(key, minScore, maxScore, token);
         }
 
         public Task<SortedSetScoreResult> SortedSetIncrementAsync(string key, double increment, byte[] member, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetIncrementCoreAsync(key, increment, member, token);
         }
 
         public Task<SortedSetRangeResult> SortedSetRangeAsync(string key, int start, int stop, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetRangeCoreAsync(key, start, stop, token);
         }
 
         public Task<SortedSetRangeResult> SortedSetRangeByScoreAsync(string key, double minScore, double maxScore, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetRangeByScoreCoreAsync(key, minScore, maxScore, token);
         }
 
         public Task<SortedSetRankResult> SortedSetRankAsync(string key, byte[] member, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetRankCoreAsync(key, member, reverse: false, token);
         }
 
         public Task<SortedSetCountResult> SortedSetRemoveAsync(string key, byte[][] members, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetRemoveCoreAsync(key, members, token);
         }
 
         public Task<SortedSetRemoveRangeResult> SortedSetRemoveRangeByScoreAsync(string key, double minScore, double maxScore, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetRemoveRangeByScoreCoreAsync(key, minScore, maxScore, token);
         }
 
         public Task<SortedSetRankResult> SortedSetReverseRankAsync(string key, byte[] member, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetRankCoreAsync(key, member, reverse: true, token);
         }
 
         public Task<SortedSetScoreResult> SortedSetScoreAsync(string key, byte[] member, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return SortedSetScoreCoreAsync(key, member, token);
         }
 
         public Task<StreamAckResult> StreamAckAsync(string key, string group, string[] ids, CancellationToken token = default)
@@ -859,7 +984,11 @@ namespace Dredis.Extensions.Storage.Mongo
             var hashResult = await hashCollection.DeleteManyAsync(hashFilter, token);
             var listFilter = Builders<ListDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var listResult = await listCollection.DeleteManyAsync(listFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount;
+            var setFilter = Builders<SetDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var setResult = await setCollection.DeleteManyAsync(setFilter, token);
+            var sortedSetFilter = Builders<SortedSetDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var sortedSetResult = await sortedSetCollection.DeleteManyAsync(sortedSetFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -959,6 +1088,40 @@ namespace Dredis.Extensions.Storage.Mongo
                 }
 
                 return (long)(listDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
+            var setDoc = await setCollection.Find(SetKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (setDoc != null)
+            {
+                if (!setDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (setDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await setCollection.DeleteOneAsync(SetKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(setDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
+            var sortedSetDoc = await sortedSetCollection.Find(SortedSetKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (sortedSetDoc != null)
+            {
+                if (!sortedSetDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (sortedSetDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await sortedSetCollection.DeleteOneAsync(SortedSetKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(sortedSetDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
             return -2;
@@ -1164,7 +1327,571 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var hashCount = await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token);
-            return hashCount > 0;
+            if (hashCount > 0)
+            {
+                return true;
+            }
+
+            var setCount = await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token);
+            if (setCount > 0)
+            {
+                return true;
+            }
+
+            var sortedSetCount = await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token);
+            return sortedSetCount > 0;
+        }
+
+        private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
+
+        private static List<SortedSetMemberDocument> SortSortedSetMembers(IEnumerable<SortedSetMemberDocument> members)
+        {
+            return members
+                .OrderBy(x => x.Score)
+                .ThenBy(x => x.MemberKey, StringComparer.Ordinal)
+                .ToList();
+        }
+
+        private async Task<bool> IsSetWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsSortedSetWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<SetCountResult> SetAddCoreAsync(string key, byte[][] members, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SetCountResult(SetResultStatus.WrongType, 0);
+            }
+
+            if (members.Length == 0)
+            {
+                return new SetCountResult(SetResultStatus.Ok, 0);
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await setCollection.Find(ActiveSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    try
+                    {
+                        var unique = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+                        for (int i = 0; i < members.Length; i++)
+                        {
+                            unique[ToMemberKey(members[i])] = members[i];
+                        }
+
+                        var created = new SetDocument
+                        {
+                            Key = key,
+                            ExpireAt = null,
+                            Members = unique.Select(x => new SetMemberDocument { MemberKey = x.Key, Member = x.Value }).ToList()
+                        };
+
+                        await setCollection.InsertOneAsync(created, null, token);
+                        return new SetCountResult(SetResultStatus.Ok, created.Members.Count);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                var existing = new HashSet<string>(doc.Members.Select(x => x.MemberKey), StringComparer.Ordinal);
+                long added = 0;
+                for (int i = 0; i < members.Length; i++)
+                {
+                    var memberKey = ToMemberKey(members[i]);
+                    if (existing.Add(memberKey))
+                    {
+                        doc.Members.Add(new SetMemberDocument { MemberKey = memberKey, Member = members[i] });
+                        added++;
+                    }
+                }
+
+                if (added == 0)
+                {
+                    return new SetCountResult(SetResultStatus.Ok, 0);
+                }
+
+                var replace = await setCollection.ReplaceOneAsync(
+                    Builders<SetDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+
+                if (replace.MatchedCount > 0)
+                {
+                    return new SetCountResult(SetResultStatus.Ok, added);
+                }
+            }
+
+            return new SetCountResult(SetResultStatus.Ok, 0);
+        }
+
+        private async Task<SetCountResult> SetRemoveCoreAsync(string key, byte[][] members, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SetCountResult(SetResultStatus.WrongType, 0);
+            }
+
+            if (members.Length == 0)
+            {
+                return new SetCountResult(SetResultStatus.Ok, 0);
+            }
+
+            var doc = await setCollection.Find(ActiveSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SetCountResult(SetResultStatus.Ok, 0);
+            }
+
+            var removeKeys = new HashSet<string>(members.Select(ToMemberKey), StringComparer.Ordinal);
+            var original = doc.Members.Count;
+            doc.Members.RemoveAll(x => removeKeys.Contains(x.MemberKey));
+            var removed = original - doc.Members.Count;
+            if (removed <= 0)
+            {
+                return new SetCountResult(SetResultStatus.Ok, 0);
+            }
+
+            if (doc.Members.Count == 0)
+            {
+                await setCollection.DeleteOneAsync(Builders<SetDocument>.Filter.Eq(x => x.Id, doc.Id), token);
+            }
+            else
+            {
+                await setCollection.ReplaceOneAsync(Builders<SetDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            }
+
+            return new SetCountResult(SetResultStatus.Ok, removed);
+        }
+
+        private async Task<SetMembersResult> SetMembersCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SetMembersResult(SetResultStatus.WrongType, Array.Empty<byte[]>());
+            }
+
+            var doc = await setCollection.Find(ActiveSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SetMembersResult(SetResultStatus.Ok, Array.Empty<byte[]>());
+            }
+
+            return new SetMembersResult(SetResultStatus.Ok, doc.Members.Select(x => x.Member).ToArray());
+        }
+
+        private async Task<SetCountResult> SetCardinalityCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SetCountResult(SetResultStatus.WrongType, 0);
+            }
+
+            var doc = await setCollection.Find(ActiveSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            return new SetCountResult(SetResultStatus.Ok, doc?.Members.Count ?? 0);
+        }
+
+        private async Task<SortedSetCountResult> SortedSetAddCoreAsync(string key, SortedSetEntry[] entries, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.WrongType, 0);
+            }
+
+            if (entries.Length == 0)
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.Ok, 0);
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    try
+                    {
+                        var map = new Dictionary<string, SortedSetMemberDocument>(StringComparer.Ordinal);
+                        for (int i = 0; i < entries.Length; i++)
+                        {
+                            var memberKey = ToMemberKey(entries[i].Member);
+                            map[memberKey] = new SortedSetMemberDocument
+                            {
+                                MemberKey = memberKey,
+                                Member = entries[i].Member,
+                                Score = entries[i].Score
+                            };
+                        }
+
+                        var created = new SortedSetDocument
+                        {
+                            Key = key,
+                            ExpireAt = null,
+                            Members = SortSortedSetMembers(map.Values)
+                        };
+
+                        await sortedSetCollection.InsertOneAsync(created, null, token);
+                        return new SortedSetCountResult(SortedSetResultStatus.Ok, created.Members.Count);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                var byKey = doc.Members.ToDictionary(x => x.MemberKey, x => x, StringComparer.Ordinal);
+                long added = 0;
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    var memberKey = ToMemberKey(entries[i].Member);
+                    if (byKey.TryGetValue(memberKey, out var existing))
+                    {
+                        existing.Score = entries[i].Score;
+                        existing.Member = entries[i].Member;
+                    }
+                    else
+                    {
+                        var createdMember = new SortedSetMemberDocument
+                        {
+                            MemberKey = memberKey,
+                            Member = entries[i].Member,
+                            Score = entries[i].Score
+                        };
+                        doc.Members.Add(createdMember);
+                        byKey[memberKey] = createdMember;
+                        added++;
+                    }
+                }
+
+                doc.Members = SortSortedSetMembers(doc.Members);
+                var replace = await sortedSetCollection.ReplaceOneAsync(
+                    Builders<SortedSetDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+
+                if (replace.MatchedCount > 0)
+                {
+                    return new SortedSetCountResult(SortedSetResultStatus.Ok, added);
+                }
+            }
+
+            return new SortedSetCountResult(SortedSetResultStatus.Ok, 0);
+        }
+
+        private async Task<SortedSetCountResult> SortedSetRemoveCoreAsync(string key, byte[][] members, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.WrongType, 0);
+            }
+
+            if (members.Length == 0)
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.Ok, 0);
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.Ok, 0);
+            }
+
+            var removeKeys = new HashSet<string>(members.Select(ToMemberKey), StringComparer.Ordinal);
+            var original = doc.Members.Count;
+            doc.Members.RemoveAll(x => removeKeys.Contains(x.MemberKey));
+            var removed = original - doc.Members.Count;
+
+            if (removed <= 0)
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.Ok, 0);
+            }
+
+            if (doc.Members.Count == 0)
+            {
+                await sortedSetCollection.DeleteOneAsync(Builders<SortedSetDocument>.Filter.Eq(x => x.Id, doc.Id), token);
+            }
+            else
+            {
+                await sortedSetCollection.ReplaceOneAsync(Builders<SortedSetDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            }
+
+            return new SortedSetCountResult(SortedSetResultStatus.Ok, removed);
+        }
+
+        private async Task<SortedSetRangeResult> SortedSetRangeCoreAsync(string key, int start, int stop, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetRangeResult(SortedSetResultStatus.WrongType, Array.Empty<SortedSetEntry>());
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SortedSetRangeResult(SortedSetResultStatus.Ok, Array.Empty<SortedSetEntry>());
+            }
+
+            var sorted = SortSortedSetMembers(doc.Members);
+            if (!TryNormalizeRange(sorted.Count, start, stop, out var from, out var to))
+            {
+                return new SortedSetRangeResult(SortedSetResultStatus.Ok, Array.Empty<SortedSetEntry>());
+            }
+
+            var entries = sorted
+                .Skip(from)
+                .Take(to - from + 1)
+                .Select(x => new SortedSetEntry(x.Member, x.Score))
+                .ToArray();
+
+            return new SortedSetRangeResult(SortedSetResultStatus.Ok, entries);
+        }
+
+        private async Task<SortedSetCountResult> SortedSetCardinalityCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.WrongType, 0);
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            return new SortedSetCountResult(SortedSetResultStatus.Ok, doc?.Members.Count ?? 0);
+        }
+
+        private async Task<SortedSetScoreResult> SortedSetScoreCoreAsync(string key, byte[] member, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetScoreResult(SortedSetResultStatus.WrongType, null);
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new SortedSetScoreResult(SortedSetResultStatus.Ok, null);
+            }
+
+            var memberKey = ToMemberKey(member);
+            var existing = doc.Members.FirstOrDefault(x => string.Equals(x.MemberKey, memberKey, StringComparison.Ordinal));
+            return new SortedSetScoreResult(SortedSetResultStatus.Ok, existing?.Score);
+        }
+
+        private async Task<SortedSetRangeResult> SortedSetRangeByScoreCoreAsync(string key, double minScore, double maxScore, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetRangeResult(SortedSetResultStatus.WrongType, Array.Empty<SortedSetEntry>());
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SortedSetRangeResult(SortedSetResultStatus.Ok, Array.Empty<SortedSetEntry>());
+            }
+
+            var entries = SortSortedSetMembers(doc.Members)
+                .Where(x => x.Score >= minScore && x.Score <= maxScore)
+                .Select(x => new SortedSetEntry(x.Member, x.Score))
+                .ToArray();
+
+            return new SortedSetRangeResult(SortedSetResultStatus.Ok, entries);
+        }
+
+        private async Task<SortedSetScoreResult> SortedSetIncrementCoreAsync(string key, double increment, byte[] member, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetScoreResult(SortedSetResultStatus.WrongType, null);
+            }
+
+            var memberKey = ToMemberKey(member);
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    try
+                    {
+                        var score = increment;
+                        var created = new SortedSetDocument
+                        {
+                            Key = key,
+                            ExpireAt = null,
+                            Members = new List<SortedSetMemberDocument>
+                            {
+                                new SortedSetMemberDocument { MemberKey = memberKey, Member = member, Score = score }
+                            }
+                        };
+
+                        await sortedSetCollection.InsertOneAsync(created, null, token);
+                        return new SortedSetScoreResult(SortedSetResultStatus.Ok, score);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                var existing = doc.Members.FirstOrDefault(x => string.Equals(x.MemberKey, memberKey, StringComparison.Ordinal));
+                if (existing == null)
+                {
+                    existing = new SortedSetMemberDocument { MemberKey = memberKey, Member = member, Score = increment };
+                    doc.Members.Add(existing);
+                }
+                else
+                {
+                    existing.Member = member;
+                    existing.Score += increment;
+                }
+
+                doc.Members = SortSortedSetMembers(doc.Members);
+                var replace = await sortedSetCollection.ReplaceOneAsync(
+                    Builders<SortedSetDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+
+                if (replace.MatchedCount > 0)
+                {
+                    return new SortedSetScoreResult(SortedSetResultStatus.Ok, existing.Score);
+                }
+            }
+
+            return new SortedSetScoreResult(SortedSetResultStatus.Ok, null);
+        }
+
+        private async Task<SortedSetCountResult> SortedSetCountByScoreCoreAsync(string key, double minScore, double maxScore, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.WrongType, 0);
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SortedSetCountResult(SortedSetResultStatus.Ok, 0);
+            }
+
+            var count = doc.Members.LongCount(x => x.Score >= minScore && x.Score <= maxScore);
+            return new SortedSetCountResult(SortedSetResultStatus.Ok, count);
+        }
+
+        private async Task<SortedSetRankResult> SortedSetRankCoreAsync(string key, byte[] member, bool reverse, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetRankResult(SortedSetResultStatus.WrongType, null);
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SortedSetRankResult(SortedSetResultStatus.Ok, null);
+            }
+
+            var sorted = SortSortedSetMembers(doc.Members);
+            var memberKey = ToMemberKey(member);
+            var index = sorted.FindIndex(x => string.Equals(x.MemberKey, memberKey, StringComparison.Ordinal));
+            if (index < 0)
+            {
+                return new SortedSetRankResult(SortedSetResultStatus.Ok, null);
+            }
+
+            long rank = reverse ? sorted.Count - 1 - index : index;
+            return new SortedSetRankResult(SortedSetResultStatus.Ok, rank);
+        }
+
+        private async Task<SortedSetRemoveRangeResult> SortedSetRemoveRangeByScoreCoreAsync(string key, double minScore, double maxScore, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsSortedSetWrongTypeAsync(key, nowUtc, token))
+            {
+                return new SortedSetRemoveRangeResult(SortedSetResultStatus.WrongType, 0);
+            }
+
+            var doc = await sortedSetCollection.Find(ActiveSortedSetKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Members.Count == 0)
+            {
+                return new SortedSetRemoveRangeResult(SortedSetResultStatus.Ok, 0);
+            }
+
+            var original = doc.Members.Count;
+            doc.Members.RemoveAll(x => x.Score >= minScore && x.Score <= maxScore);
+            var removed = original - doc.Members.Count;
+            if (removed <= 0)
+            {
+                return new SortedSetRemoveRangeResult(SortedSetResultStatus.Ok, 0);
+            }
+
+            if (doc.Members.Count == 0)
+            {
+                await sortedSetCollection.DeleteOneAsync(Builders<SortedSetDocument>.Filter.Eq(x => x.Id, doc.Id), token);
+            }
+            else
+            {
+                await sortedSetCollection.ReplaceOneAsync(Builders<SortedSetDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            }
+
+            return new SortedSetRemoveRangeResult(SortedSetResultStatus.Ok, removed);
         }
 
         private static void ApplyPushValues(List<byte[]> destination, byte[][] values, bool left)
