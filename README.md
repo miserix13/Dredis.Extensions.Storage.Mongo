@@ -63,6 +63,10 @@ This package currently implements the following `IKeyValueStore` areas:
   - `TDIGEST.RANK`, `TDIGEST.REVRANK`, `TDIGEST.BYRANK`, `TDIGEST.BYREVRANK`
   - `TDIGEST.TRIMMED_MEAN`, `TDIGEST.MIN`, `TDIGEST.MAX`, `TDIGEST.INFO`
 
+- **TopK**
+  - `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.INCRBY`
+  - `TOPK.QUERY`, `TOPK.COUNT`, `TOPK.LIST`, `TOPK.INFO`
+
 ## Quick start
 
 ```csharp
@@ -89,9 +93,9 @@ The `collectionName` value is used as a prefix for type-specific collections (fo
 
 ## Notes
 
-- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest values.
+- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest/topk values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
-- Remaining `IKeyValueStore` areas (JSON, Vector, TimeSeries, TopK, etc.) are still pending.
+- Remaining `IKeyValueStore` areas (JSON, Vector, TimeSeries, etc.) are still pending.
 
 ## Third-party notice
 

@@ -21,6 +21,7 @@ namespace Dredis.Extensions.Storage.Mongo
     private readonly IMongoCollection<BloomDocument> bloomCollection;
     private readonly IMongoCollection<CuckooDocument> cuckooCollection;
     private readonly IMongoCollection<TDigestDocument> tdigestCollection;
+    private readonly IMongoCollection<TopKDocument> topKCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -35,6 +36,7 @@ namespace Dredis.Extensions.Storage.Mongo
             this.bloomCollection = this.database.GetCollection<BloomDocument>($"{collectionName ?? "kvstore"}_bloom");
             this.cuckooCollection = this.database.GetCollection<CuckooDocument>($"{collectionName ?? "kvstore"}_cuckoo");
             this.tdigestCollection = this.database.GetCollection<TDigestDocument>($"{collectionName ?? "kvstore"}_tdigest");
+            this.topKCollection = this.database.GetCollection<TopKDocument>($"{collectionName ?? "kvstore"}_topk");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -76,6 +78,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var tdigestKeyIndexModel = new CreateIndexModel<TDigestDocument>(tdigestKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.tdigestCollection.Indexes.CreateOne(tdigestKeyIndexModel);
 
+            var topkKeyIndexKeys = Builders<TopKDocument>.IndexKeys.Ascending(x => x.Key);
+            var topkKeyIndexModel = new CreateIndexModel<TopKDocument>(topkKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.topKCollection.Indexes.CreateOne(topkKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -116,6 +122,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var tdigestTtlIndexKeys = Builders<TDigestDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var tdigestTtlIndexModel = new CreateIndexModel<TDigestDocument>(tdigestTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.tdigestCollection.Indexes.CreateOne(tdigestTtlIndexModel);
+
+            var topkTtlIndexKeys = Builders<TopKDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var topkTtlIndexModel = new CreateIndexModel<TopKDocument>(topkTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.topKCollection.Indexes.CreateOne(topkTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -275,6 +285,25 @@ namespace Dredis.Extensions.Storage.Mongo
             public DateTime? ExpireAt { get; set; }
         }
 
+        private class TopKItemDocument
+        {
+            public string ItemKey { get; set; } = null!;
+            public byte[] Item { get; set; } = null!;
+            public long Count { get; set; }
+        }
+
+        private class TopKDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public int K { get; set; }
+            public int Width { get; set; }
+            public int Depth { get; set; }
+            public double Decay { get; set; }
+            public List<TopKItemDocument> Items { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
         private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
 
         private static FilterDefinition<KeyValueDocument> ActiveFilter(DateTime nowUtc) =>
@@ -420,6 +449,21 @@ namespace Dredis.Extensions.Storage.Mongo
                 Builders<TDigestDocument>.Filter.In(x => x.Key, keys),
                 ActiveTDigestFilter(nowUtc));
 
+        private FilterDefinition<TopKDocument> TopKKeyFilter(string key) => Builders<TopKDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<TopKDocument> ActiveTopKFilter(DateTime nowUtc) =>
+            Builders<TopKDocument>.Filter.Or(
+                Builders<TopKDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<TopKDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<TopKDocument> ActiveTopKKeyFilter(string key, DateTime nowUtc) =>
+            Builders<TopKDocument>.Filter.And(TopKKeyFilter(key), ActiveTopKFilter(nowUtc));
+
+        private FilterDefinition<TopKDocument> ActiveTopKKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<TopKDocument>.Filter.And(
+                Builders<TopKDocument>.Filter.In(x => x.Key, keys),
+                ActiveTopKFilter(nowUtc));
+
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
                 Builders<HashDocument>.Filter.In(x => x.Key, keys),
@@ -503,7 +547,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var cuckooResult = await cuckooCollection.DeleteManyAsync(cuckooFilter, token);
             var tdigestFilter = Builders<TDigestDocument>.Filter.In(x => x.Key, keys);
             var tdigestResult = await tdigestCollection.DeleteManyAsync(tdigestFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount;
+            var topkFilter = Builders<TopKDocument>.Filter.In(x => x.Key, keys);
+            var topkResult = await topKCollection.DeleteManyAsync(topkFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -563,7 +609,13 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            var tdigestCount = await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token);
+            if (tdigestCount > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -636,6 +688,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var topkKeys = await topKCollection.Find(ActiveTopKKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in topkKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -655,6 +713,7 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await bloomCollection.DeleteOneAsync(ActiveBloomKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await cuckooCollection.DeleteOneAsync(ActiveCuckooKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await tdigestCollection.DeleteOneAsync(ActiveTDigestKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await topKCollection.DeleteOneAsync(ActiveTopKKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -735,7 +794,15 @@ namespace Dredis.Extensions.Storage.Mongo
             var tdigestFilter = ActiveTDigestKeyFilter(key, nowUtc);
             var tdigestUpdate = Builders<TDigestDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var tdigestResult = await tdigestCollection.UpdateOneAsync(tdigestFilter, tdigestUpdate, null, token);
-            return tdigestResult.MatchedCount > 0;
+            if (tdigestResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var topkFilter = ActiveTopKKeyFilter(key, nowUtc);
+            var topkUpdate = Builders<TopKDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var topkResult = await topKCollection.UpdateOneAsync(topkFilter, topkUpdate, null, token);
+            return topkResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -1245,37 +1312,37 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<ProbabilisticStringArrayResult> TopKAddAsync(string key, byte[][] items, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TopKAddCoreAsync(key, items, token);
         }
 
         public Task<ProbabilisticArrayResult> TopKCountAsync(string key, byte[][] items, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TopKCountCoreAsync(key, items, token);
         }
 
         public Task<ProbabilisticStringArrayResult> TopKIncrByAsync(string key, KeyValuePair<byte[], long>[] increments, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TopKIncrByCoreAsync(key, increments, token);
         }
 
         public Task<ProbabilisticInfoResult> TopKInfoAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TopKInfoCoreAsync(key, token);
         }
 
         public Task<ProbabilisticStringArrayResult> TopKListAsync(string key, bool withCount, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TopKListCoreAsync(key, withCount, token);
         }
 
         public Task<ProbabilisticArrayResult> TopKQueryAsync(string key, byte[][] items, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TopKQueryCoreAsync(key, items, token);
         }
 
         public Task<ProbabilisticResultStatus> TopKReserveAsync(string key, int k, int width, int depth, double decay, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TopKReserveCoreAsync(key, k, width, depth, decay, token);
         }
 
         public Task<long> TtlAsync(string key, CancellationToken token = default)
@@ -1336,7 +1403,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var cuckooResult = await cuckooCollection.DeleteManyAsync(cuckooFilter, token);
             var tdigestFilter = Builders<TDigestDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var tdigestResult = await tdigestCollection.DeleteManyAsync(tdigestFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount;
+            var topkFilter = Builders<TopKDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var topkResult = await topKCollection.DeleteManyAsync(topkFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -1557,6 +1626,23 @@ namespace Dredis.Extensions.Storage.Mongo
                 return (long)(tdigestDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
+            var topkDoc = await topKCollection.Find(TopKKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (topkDoc != null)
+            {
+                if (!topkDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (topkDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await topKCollection.DeleteOneAsync(TopKKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(topkDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
             return -2;
         }
 
@@ -1582,7 +1668,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0 ||
                 await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0 ||
                 await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0 ||
-                await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+                await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0 ||
+                await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1806,7 +1893,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
@@ -1942,7 +2034,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsSortedSetWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -1987,7 +2084,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static bool TryParseStreamId(string id, out long milliseconds, out long sequence)
@@ -2128,7 +2230,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsHyperLogLogWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2173,7 +2280,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsBloomWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2218,7 +2330,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsCuckooWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2263,7 +2380,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsTDigestWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2308,7 +2430,62 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0;
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsTopKWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<HyperLogLogAddResult> HyperLogLogAddCoreAsync(string key, byte[][] elements, CancellationToken token)
@@ -3133,6 +3310,247 @@ namespace Dredis.Extensions.Storage.Mongo
             };
 
             return new ProbabilisticInfoResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private async Task<ProbabilisticResultStatus> TopKReserveCoreAsync(string key, int k, int width, int depth, double decay, CancellationToken token)
+        {
+            if (k <= 0 || width <= 0 || depth <= 0 || decay <= 0 || decay > 1)
+            {
+                return ProbabilisticResultStatus.InvalidArgument;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTopKWrongTypeAsync(key, nowUtc, token))
+            {
+                return ProbabilisticResultStatus.WrongType;
+            }
+
+            var existing = await topKCollection.Find(ActiveTopKKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (existing != null)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+
+            var created = new TopKDocument { Key = key, K = k, Width = width, Depth = depth, Decay = decay, ExpireAt = null, Items = new List<TopKItemDocument>() };
+            try
+            {
+                await topKCollection.InsertOneAsync(created, null, token);
+                return ProbabilisticResultStatus.Ok;
+            }
+            catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+        }
+
+        private async Task<ProbabilisticStringArrayResult> TopKAddCoreAsync(string key, byte[][] items, CancellationToken token)
+        {
+            if (items.Length == 0)
+            {
+                return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.Ok, Array.Empty<string?>());
+            }
+
+            var increments = new KeyValuePair<byte[], long>[items.Length];
+            for (int i = 0; i < items.Length; i++)
+            {
+                increments[i] = new KeyValuePair<byte[], long>(items[i], 1);
+            }
+
+            return await TopKIncrByCoreAsync(key, increments, token);
+        }
+
+        private async Task<ProbabilisticStringArrayResult> TopKIncrByCoreAsync(string key, KeyValuePair<byte[], long>[] increments, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTopKWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<string?>());
+            }
+
+            for (int i = 0; i < increments.Length; i++)
+            {
+                if (increments[i].Value <= 0)
+                {
+                    return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.InvalidArgument, Array.Empty<string?>());
+                }
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await topKCollection.Find(ActiveTopKKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<string?>());
+                }
+
+                var output = new byte[increments.Length][];
+                for (int i = 0; i < increments.Length; i++)
+                {
+                    var evicted = TopKUpsertAndMaybeEvict(doc, increments[i].Key, increments[i].Value);
+                    output[i] = evicted ?? Array.Empty<byte>();
+                }
+
+                var replaced = await topKCollection.ReplaceOneAsync(
+                    Builders<TopKDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+                if (replaced.MatchedCount > 0)
+                {
+                    return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.Ok, ToTopKStringArray(output));
+                }
+            }
+
+            return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<string?>());
+        }
+
+        private async Task<ProbabilisticArrayResult> TopKQueryCoreAsync(string key, byte[][] items, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTopKWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<long>());
+            }
+
+            var doc = await topKCollection.Find(ActiveTopKKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<long>());
+            }
+
+            var values = new long[items.Length];
+            for (int i = 0; i < items.Length; i++)
+            {
+                var itemKey = ToMemberKey(items[i]);
+                values[i] = doc.Items.Any(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal)) ? 1 : 0;
+            }
+
+            return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private async Task<ProbabilisticArrayResult> TopKCountCoreAsync(string key, byte[][] items, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTopKWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<long>());
+            }
+
+            var doc = await topKCollection.Find(ActiveTopKKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<long>());
+            }
+
+            var values = new long[items.Length];
+            for (int i = 0; i < items.Length; i++)
+            {
+                var itemKey = ToMemberKey(items[i]);
+                values[i] = doc.Items.FirstOrDefault(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal))?.Count ?? 0;
+            }
+
+            return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private async Task<ProbabilisticStringArrayResult> TopKListCoreAsync(string key, bool withCount, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTopKWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<string?>());
+            }
+
+            var doc = await topKCollection.Find(ActiveTopKKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<string?>());
+            }
+
+            var ordered = doc.Items
+                .OrderByDescending(x => x.Count)
+                .ThenBy(x => x.ItemKey, StringComparer.Ordinal)
+                .Take(doc.K)
+                .ToList();
+
+            if (!withCount)
+            {
+                return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.Ok, ToTopKStringArray(ordered.Select(x => x.Item).ToArray()));
+            }
+
+            var flattened = new List<byte[]>(ordered.Count * 2);
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                flattened.Add(ordered[i].Item);
+                flattened.Add(Encoding.UTF8.GetBytes(ordered[i].Count.ToString(CultureInfo.InvariantCulture)));
+            }
+
+            return new ProbabilisticStringArrayResult(ProbabilisticResultStatus.Ok, ToTopKStringArray(flattened.ToArray()));
+        }
+
+        private async Task<ProbabilisticInfoResult> TopKInfoCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTopKWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.WrongType, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var doc = await topKCollection.Find(ActiveTopKKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.NotFound, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var values = new[]
+            {
+                new KeyValuePair<string, string>("k", doc.K.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("width", doc.Width.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("depth", doc.Depth.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("decay", doc.Decay.ToString(CultureInfo.InvariantCulture))
+            };
+
+            return new ProbabilisticInfoResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private static byte[]? TopKUpsertAndMaybeEvict(TopKDocument doc, byte[] item, long increment)
+        {
+            var itemKey = ToMemberKey(item);
+            var existing = doc.Items.FirstOrDefault(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal));
+            if (existing != null)
+            {
+                existing.Count = checked(existing.Count + increment);
+                return null;
+            }
+
+            if (doc.Items.Count < doc.K)
+            {
+                doc.Items.Add(new TopKItemDocument { ItemKey = itemKey, Item = item, Count = increment });
+                return null;
+            }
+
+            var minItem = doc.Items
+                .OrderBy(x => x.Count)
+                .ThenBy(x => x.ItemKey, StringComparer.Ordinal)
+                .First();
+
+            var evicted = minItem.Item;
+            minItem.ItemKey = itemKey;
+            minItem.Item = item;
+            minItem.Count = checked(minItem.Count + increment);
+            return evicted;
+        }
+
+        private static string?[] ToTopKStringArray(byte[][] values)
+        {
+            var output = new string?[values.Length];
+            for (int i = 0; i < values.Length; i++)
+            {
+                output[i] = values[i].Length == 0 ? null : Encoding.UTF8.GetString(values[i]);
+            }
+
+            return output;
         }
 
         private static double ComputeQuantile(List<double> values, double quantile)
