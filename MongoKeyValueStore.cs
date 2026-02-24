@@ -23,6 +23,7 @@ namespace Dredis.Extensions.Storage.Mongo
     private readonly IMongoCollection<TDigestDocument> tdigestCollection;
     private readonly IMongoCollection<TopKDocument> topKCollection;
     private readonly IMongoCollection<VectorDocument> vectorCollection;
+    private readonly IMongoCollection<TimeSeriesDocument> timeSeriesCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -39,6 +40,7 @@ namespace Dredis.Extensions.Storage.Mongo
             this.tdigestCollection = this.database.GetCollection<TDigestDocument>($"{collectionName ?? "kvstore"}_tdigest");
             this.topKCollection = this.database.GetCollection<TopKDocument>($"{collectionName ?? "kvstore"}_topk");
             this.vectorCollection = this.database.GetCollection<VectorDocument>($"{collectionName ?? "kvstore"}_vector");
+            this.timeSeriesCollection = this.database.GetCollection<TimeSeriesDocument>($"{collectionName ?? "kvstore"}_timeseries");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -88,6 +90,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var vectorKeyIndexModel = new CreateIndexModel<VectorDocument>(vectorKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.vectorCollection.Indexes.CreateOne(vectorKeyIndexModel);
 
+            var timeseriesKeyIndexKeys = Builders<TimeSeriesDocument>.IndexKeys.Ascending(x => x.Key);
+            var timeseriesKeyIndexModel = new CreateIndexModel<TimeSeriesDocument>(timeseriesKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.timeSeriesCollection.Indexes.CreateOne(timeseriesKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -136,6 +142,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var vectorTtlIndexKeys = Builders<VectorDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var vectorTtlIndexModel = new CreateIndexModel<VectorDocument>(vectorTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.vectorCollection.Indexes.CreateOne(vectorTtlIndexModel);
+
+            var timeseriesTtlIndexKeys = Builders<TimeSeriesDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var timeseriesTtlIndexModel = new CreateIndexModel<TimeSeriesDocument>(timeseriesTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.timeSeriesCollection.Indexes.CreateOne(timeseriesTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -322,6 +332,29 @@ namespace Dredis.Extensions.Storage.Mongo
             public DateTime? ExpireAt { get; set; }
         }
 
+        private class TimeSeriesLabelDocument
+        {
+            public string Name { get; set; } = null!;
+            public string Value { get; set; } = null!;
+        }
+
+        private class TimeSeriesSampleDocument
+        {
+            public long Timestamp { get; set; }
+            public double Value { get; set; }
+        }
+
+        private class TimeSeriesDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public long RetentionTimeMs { get; set; }
+            public TimeSeriesDuplicatePolicy DuplicatePolicy { get; set; }
+            public List<TimeSeriesLabelDocument> Labels { get; set; } = new();
+            public List<TimeSeriesSampleDocument> Samples { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
         private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
 
         private static FilterDefinition<KeyValueDocument> ActiveFilter(DateTime nowUtc) =>
@@ -497,6 +530,21 @@ namespace Dredis.Extensions.Storage.Mongo
                 Builders<VectorDocument>.Filter.In(x => x.Key, keys),
                 ActiveVectorFilter(nowUtc));
 
+        private FilterDefinition<TimeSeriesDocument> TimeSeriesKeyFilter(string key) => Builders<TimeSeriesDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<TimeSeriesDocument> ActiveTimeSeriesFilter(DateTime nowUtc) =>
+            Builders<TimeSeriesDocument>.Filter.Or(
+                Builders<TimeSeriesDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<TimeSeriesDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<TimeSeriesDocument> ActiveTimeSeriesKeyFilter(string key, DateTime nowUtc) =>
+            Builders<TimeSeriesDocument>.Filter.And(TimeSeriesKeyFilter(key), ActiveTimeSeriesFilter(nowUtc));
+
+        private FilterDefinition<TimeSeriesDocument> ActiveTimeSeriesKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<TimeSeriesDocument>.Filter.And(
+                Builders<TimeSeriesDocument>.Filter.In(x => x.Key, keys),
+                ActiveTimeSeriesFilter(nowUtc));
+
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
                 Builders<HashDocument>.Filter.In(x => x.Key, keys),
@@ -584,7 +632,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var topkResult = await topKCollection.DeleteManyAsync(topkFilter, token);
             var vectorFilter = Builders<VectorDocument>.Filter.In(x => x.Key, keys);
             var vectorResult = await vectorCollection.DeleteManyAsync(vectorFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount;
+            var timeseriesFilter = Builders<TimeSeriesDocument>.Filter.In(x => x.Key, keys);
+            var timeseriesResult = await timeSeriesCollection.DeleteManyAsync(timeseriesFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount + timeseriesResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -656,7 +706,13 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            var vectorCount = await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token);
+            if (vectorCount > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -741,6 +797,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var timeseriesKeys = await timeSeriesCollection.Find(ActiveTimeSeriesKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in timeseriesKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -762,6 +824,7 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await tdigestCollection.DeleteOneAsync(ActiveTDigestKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await topKCollection.DeleteOneAsync(ActiveTopKKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await vectorCollection.DeleteOneAsync(ActiveVectorKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await timeSeriesCollection.DeleteOneAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -858,7 +921,15 @@ namespace Dredis.Extensions.Storage.Mongo
             var vectorFilter = ActiveVectorKeyFilter(key, nowUtc);
             var vectorUpdate = Builders<VectorDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var vectorResult = await vectorCollection.UpdateOneAsync(vectorFilter, vectorUpdate, null, token);
-            return vectorResult.MatchedCount > 0;
+            if (vectorResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var timeseriesFilter = ActiveTimeSeriesKeyFilter(key, nowUtc);
+            var timeseriesUpdate = Builders<TimeSeriesDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var timeseriesResult = await timeSeriesCollection.UpdateOneAsync(timeseriesFilter, timeseriesUpdate, null, token);
+            return timeseriesResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -1328,42 +1399,42 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<TimeSeriesAddResult> TimeSeriesAddAsync(string key, long timestamp, double value, TimeSeriesDuplicatePolicy? onDuplicate, bool createIfMissing, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesAddCoreAsync(key, timestamp, value, onDuplicate, createIfMissing, token);
         }
 
         public Task<TimeSeriesResultStatus> TimeSeriesCreateAsync(string key, long? retentionTimeMs, TimeSeriesDuplicatePolicy? duplicatePolicy, KeyValuePair<string, string>[]? labels, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesCreateCoreAsync(key, retentionTimeMs, duplicatePolicy, labels, token);
         }
 
         public Task<TimeSeriesDeleteResult> TimeSeriesDeleteAsync(string key, long fromTimestamp, long toTimestamp, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesDeleteCoreAsync(key, fromTimestamp, toTimestamp, token);
         }
 
         public Task<TimeSeriesGetResult> TimeSeriesGetAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesGetCoreAsync(key, token);
         }
 
         public Task<TimeSeriesAddResult> TimeSeriesIncrementByAsync(string key, double increment, long? timestamp, bool createIfMissing, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesIncrementByCoreAsync(key, increment, timestamp, createIfMissing, token);
         }
 
         public Task<TimeSeriesInfoResult> TimeSeriesInfoAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesInfoCoreAsync(key, token);
         }
 
         public Task<TimeSeriesMRangeResult> TimeSeriesMultiRangeAsync(long fromTimestamp, long toTimestamp, bool reverse, int? count, string? aggregationType, long? bucketDurationMs, KeyValuePair<string, string>[] filters, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesMultiRangeCoreAsync(fromTimestamp, toTimestamp, reverse, count, aggregationType, bucketDurationMs, filters, token);
         }
 
         public Task<TimeSeriesRangeResult> TimeSeriesRangeAsync(string key, long fromTimestamp, long toTimestamp, bool reverse, int? count, string? aggregationType, long? bucketDurationMs, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TimeSeriesRangeCoreAsync(key, fromTimestamp, toTimestamp, reverse, count, aggregationType, bucketDurationMs, token);
         }
 
         public Task<ProbabilisticStringArrayResult> TopKAddAsync(string key, byte[][] items, CancellationToken token = default)
@@ -1463,7 +1534,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var topkResult = await topKCollection.DeleteManyAsync(topkFilter, token);
             var vectorFilter = Builders<VectorDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var vectorResult = await vectorCollection.DeleteManyAsync(vectorFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount;
+            var timeseriesFilter = Builders<TimeSeriesDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var timeseriesResult = await timeSeriesCollection.DeleteManyAsync(timeseriesFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount + timeseriesResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -1718,6 +1791,23 @@ namespace Dredis.Extensions.Storage.Mongo
                 return (long)(vectorDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
+            var timeSeriesDoc = await timeSeriesCollection.Find(TimeSeriesKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (timeSeriesDoc != null)
+            {
+                if (!timeSeriesDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (timeSeriesDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await timeSeriesCollection.DeleteOneAsync(TimeSeriesKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(timeSeriesDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
             return -2;
         }
 
@@ -1745,7 +1835,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0 ||
                 await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0 ||
                 await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0 ||
-                await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+                await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0 ||
+                await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1979,7 +2070,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
@@ -2125,7 +2221,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsSortedSetWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2180,7 +2281,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static bool TryParseStreamId(string id, out long milliseconds, out long sequence)
@@ -2331,7 +2437,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsHyperLogLogWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2386,7 +2497,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsBloomWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2441,7 +2557,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsCuckooWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2496,7 +2617,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsTDigestWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2551,7 +2677,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsTopKWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2606,7 +2737,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsVectorWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2661,7 +2797,72 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0;
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsTimeSeriesWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<HyperLogLogAddResult> HyperLogLogAddCoreAsync(string key, byte[][] elements, CancellationToken token)
@@ -3486,6 +3687,529 @@ namespace Dredis.Extensions.Storage.Mongo
             };
 
             return new ProbabilisticInfoResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private async Task<TimeSeriesResultStatus> TimeSeriesCreateCoreAsync(string key, long? retentionTimeMs, TimeSeriesDuplicatePolicy? duplicatePolicy, KeyValuePair<string, string>[]? labels, CancellationToken token)
+        {
+            if (retentionTimeMs.HasValue && retentionTimeMs.Value < 0)
+            {
+                return TimeSeriesResultStatus.InvalidArgument;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTimeSeriesWrongTypeAsync(key, nowUtc, token))
+            {
+                return TimeSeriesResultStatus.WrongType;
+            }
+
+            var existing = await timeSeriesCollection.Find(ActiveTimeSeriesKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (existing != null)
+            {
+                return TimeSeriesResultStatus.Exists;
+            }
+
+            var created = new TimeSeriesDocument
+            {
+                Key = key,
+                RetentionTimeMs = retentionTimeMs ?? 0,
+                DuplicatePolicy = duplicatePolicy ?? TimeSeriesDuplicatePolicy.Last,
+                Labels = (labels ?? Array.Empty<KeyValuePair<string, string>>())
+                    .Select(x => new TimeSeriesLabelDocument { Name = x.Key, Value = x.Value })
+                    .ToList(),
+                Samples = new List<TimeSeriesSampleDocument>(),
+                ExpireAt = null
+            };
+
+            try
+            {
+                await timeSeriesCollection.InsertOneAsync(created, null, token);
+                return TimeSeriesResultStatus.Ok;
+            }
+            catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+            {
+                return TimeSeriesResultStatus.Exists;
+            }
+        }
+
+        private async Task<TimeSeriesAddResult> TimeSeriesAddCoreAsync(string key, long timestamp, double value, TimeSeriesDuplicatePolicy? onDuplicate, bool createIfMissing, CancellationToken token)
+        {
+            if (timestamp < 0 || double.IsNaN(value) || double.IsInfinity(value))
+            {
+                return new TimeSeriesAddResult(TimeSeriesResultStatus.InvalidArgument, null);
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTimeSeriesWrongTypeAsync(key, nowUtc, token))
+            {
+                return new TimeSeriesAddResult(TimeSeriesResultStatus.WrongType, null);
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await timeSeriesCollection.Find(ActiveTimeSeriesKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    if (!createIfMissing)
+                    {
+                        return new TimeSeriesAddResult(TimeSeriesResultStatus.NotFound, null);
+                    }
+
+                    try
+                    {
+                        doc = new TimeSeriesDocument
+                        {
+                            Key = key,
+                            RetentionTimeMs = 0,
+                            DuplicatePolicy = TimeSeriesDuplicatePolicy.Last,
+                            Labels = new List<TimeSeriesLabelDocument>(),
+                            Samples = new List<TimeSeriesSampleDocument>(),
+                            ExpireAt = null
+                        };
+                        await timeSeriesCollection.InsertOneAsync(doc, null, token);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                PruneTimeSeriesRetention(doc.Samples, doc.RetentionTimeMs, timestamp);
+
+                var existingSample = doc.Samples.FirstOrDefault(x => x.Timestamp == timestamp);
+                if (existingSample == null)
+                {
+                    doc.Samples.Add(new TimeSeriesSampleDocument { Timestamp = timestamp, Value = value });
+                }
+                else
+                {
+                    var policy = onDuplicate ?? doc.DuplicatePolicy;
+                    switch (policy)
+                    {
+                        case TimeSeriesDuplicatePolicy.Last:
+                            existingSample.Value = value;
+                            break;
+                        case TimeSeriesDuplicatePolicy.First:
+                            break;
+                        case TimeSeriesDuplicatePolicy.Min:
+                            existingSample.Value = Math.Min(existingSample.Value, value);
+                            break;
+                        case TimeSeriesDuplicatePolicy.Max:
+                            existingSample.Value = Math.Max(existingSample.Value, value);
+                            break;
+                        case TimeSeriesDuplicatePolicy.Sum:
+                            existingSample.Value += value;
+                            break;
+                        case TimeSeriesDuplicatePolicy.Block:
+                            return new TimeSeriesAddResult(TimeSeriesResultStatus.InvalidArgument, null);
+                    }
+                }
+
+                doc.Samples = doc.Samples
+                    .OrderBy(x => x.Timestamp)
+                    .ToList();
+                PruneTimeSeriesRetention(doc.Samples, doc.RetentionTimeMs, timestamp);
+
+                var replaced = await timeSeriesCollection.ReplaceOneAsync(
+                    Builders<TimeSeriesDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+
+                if (replaced.MatchedCount > 0)
+                {
+                    return new TimeSeriesAddResult(TimeSeriesResultStatus.Ok, timestamp);
+                }
+            }
+
+            return new TimeSeriesAddResult(TimeSeriesResultStatus.NotFound, null);
+        }
+
+        private async Task<TimeSeriesAddResult> TimeSeriesIncrementByCoreAsync(string key, double increment, long? timestamp, bool createIfMissing, CancellationToken token)
+        {
+            if (double.IsNaN(increment) || double.IsInfinity(increment))
+            {
+                return new TimeSeriesAddResult(TimeSeriesResultStatus.InvalidArgument, null);
+            }
+
+            var targetTimestamp = timestamp ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (targetTimestamp < 0)
+            {
+                return new TimeSeriesAddResult(TimeSeriesResultStatus.InvalidArgument, null);
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTimeSeriesWrongTypeAsync(key, nowUtc, token))
+            {
+                return new TimeSeriesAddResult(TimeSeriesResultStatus.WrongType, null);
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await timeSeriesCollection.Find(ActiveTimeSeriesKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    if (!createIfMissing)
+                    {
+                        return new TimeSeriesAddResult(TimeSeriesResultStatus.NotFound, null);
+                    }
+
+                    try
+                    {
+                        doc = new TimeSeriesDocument
+                        {
+                            Key = key,
+                            RetentionTimeMs = 0,
+                            DuplicatePolicy = TimeSeriesDuplicatePolicy.Last,
+                            Labels = new List<TimeSeriesLabelDocument>(),
+                            Samples = new List<TimeSeriesSampleDocument>(),
+                            ExpireAt = null
+                        };
+                        await timeSeriesCollection.InsertOneAsync(doc, null, token);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                PruneTimeSeriesRetention(doc.Samples, doc.RetentionTimeMs, targetTimestamp);
+                var existingSample = doc.Samples.FirstOrDefault(x => x.Timestamp == targetTimestamp);
+                if (existingSample == null)
+                {
+                    doc.Samples.Add(new TimeSeriesSampleDocument { Timestamp = targetTimestamp, Value = increment });
+                }
+                else
+                {
+                    existingSample.Value += increment;
+                }
+
+                doc.Samples = doc.Samples
+                    .OrderBy(x => x.Timestamp)
+                    .ToList();
+                PruneTimeSeriesRetention(doc.Samples, doc.RetentionTimeMs, targetTimestamp);
+
+                var replaced = await timeSeriesCollection.ReplaceOneAsync(
+                    Builders<TimeSeriesDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+                if (replaced.MatchedCount > 0)
+                {
+                    return new TimeSeriesAddResult(TimeSeriesResultStatus.Ok, targetTimestamp);
+                }
+            }
+
+            return new TimeSeriesAddResult(TimeSeriesResultStatus.NotFound, null);
+        }
+
+        private async Task<TimeSeriesGetResult> TimeSeriesGetCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTimeSeriesWrongTypeAsync(key, nowUtc, token))
+            {
+                return new TimeSeriesGetResult(TimeSeriesResultStatus.WrongType, null);
+            }
+
+            var doc = await timeSeriesCollection.Find(ActiveTimeSeriesKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new TimeSeriesGetResult(TimeSeriesResultStatus.NotFound, null);
+            }
+
+            if (doc.Samples.Count == 0)
+            {
+                return new TimeSeriesGetResult(TimeSeriesResultStatus.Ok, null);
+            }
+
+            var latest = doc.Samples
+                .OrderByDescending(x => x.Timestamp)
+                .First();
+            return new TimeSeriesGetResult(TimeSeriesResultStatus.Ok, new TimeSeriesSample(latest.Timestamp, latest.Value));
+        }
+
+        private async Task<TimeSeriesRangeResult> TimeSeriesRangeCoreAsync(string key, long fromTimestamp, long toTimestamp, bool reverse, int? count, string? aggregationType, long? bucketDurationMs, CancellationToken token)
+        {
+            if (fromTimestamp > toTimestamp || (count.HasValue && count.Value < 0))
+            {
+                return new TimeSeriesRangeResult(TimeSeriesResultStatus.InvalidArgument, Array.Empty<TimeSeriesSample>());
+            }
+
+            if (!TryNormalizeTimeSeriesAggregation(aggregationType, out var normalizedAggregation))
+            {
+                return new TimeSeriesRangeResult(TimeSeriesResultStatus.InvalidArgument, Array.Empty<TimeSeriesSample>());
+            }
+
+            if (normalizedAggregation != null && (!bucketDurationMs.HasValue || bucketDurationMs.Value <= 0))
+            {
+                return new TimeSeriesRangeResult(TimeSeriesResultStatus.InvalidArgument, Array.Empty<TimeSeriesSample>());
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTimeSeriesWrongTypeAsync(key, nowUtc, token))
+            {
+                return new TimeSeriesRangeResult(TimeSeriesResultStatus.WrongType, Array.Empty<TimeSeriesSample>());
+            }
+
+            var doc = await timeSeriesCollection.Find(ActiveTimeSeriesKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new TimeSeriesRangeResult(TimeSeriesResultStatus.NotFound, Array.Empty<TimeSeriesSample>());
+            }
+
+            var samples = GetTimeSeriesSamplesInRange(doc.Samples, fromTimestamp, toTimestamp);
+            if (normalizedAggregation != null)
+            {
+                samples = AggregateTimeSeriesSamples(samples, bucketDurationMs!.Value, normalizedAggregation);
+            }
+
+            if (reverse)
+            {
+                Array.Reverse(samples);
+            }
+
+            if (count.HasValue)
+            {
+                samples = samples.Take(count.Value).ToArray();
+            }
+
+            return new TimeSeriesRangeResult(TimeSeriesResultStatus.Ok, samples);
+        }
+
+        private async Task<TimeSeriesDeleteResult> TimeSeriesDeleteCoreAsync(string key, long fromTimestamp, long toTimestamp, CancellationToken token)
+        {
+            if (fromTimestamp > toTimestamp)
+            {
+                return new TimeSeriesDeleteResult(TimeSeriesResultStatus.InvalidArgument, 0);
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTimeSeriesWrongTypeAsync(key, nowUtc, token))
+            {
+                return new TimeSeriesDeleteResult(TimeSeriesResultStatus.WrongType, 0);
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await timeSeriesCollection.Find(ActiveTimeSeriesKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    return new TimeSeriesDeleteResult(TimeSeriesResultStatus.Ok, 0);
+                }
+
+                var originalCount = doc.Samples.Count;
+                doc.Samples.RemoveAll(x => x.Timestamp >= fromTimestamp && x.Timestamp <= toTimestamp);
+                var deleted = originalCount - doc.Samples.Count;
+                if (deleted <= 0)
+                {
+                    return new TimeSeriesDeleteResult(TimeSeriesResultStatus.Ok, 0);
+                }
+
+                var replaced = await timeSeriesCollection.ReplaceOneAsync(
+                    Builders<TimeSeriesDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+                if (replaced.MatchedCount > 0)
+                {
+                    return new TimeSeriesDeleteResult(TimeSeriesResultStatus.Ok, deleted);
+                }
+            }
+
+            return new TimeSeriesDeleteResult(TimeSeriesResultStatus.NotFound, 0);
+        }
+
+        private async Task<TimeSeriesInfoResult> TimeSeriesInfoCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTimeSeriesWrongTypeAsync(key, nowUtc, token))
+            {
+                return new TimeSeriesInfoResult(TimeSeriesResultStatus.WrongType, 0, null, null, 0, TimeSeriesDuplicatePolicy.Last, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var doc = await timeSeriesCollection.Find(ActiveTimeSeriesKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new TimeSeriesInfoResult(TimeSeriesResultStatus.NotFound, 0, null, null, 0, TimeSeriesDuplicatePolicy.Last, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            long? firstTimestamp = null;
+            long? lastTimestamp = null;
+            if (doc.Samples.Count > 0)
+            {
+                firstTimestamp = doc.Samples.Min(x => x.Timestamp);
+                lastTimestamp = doc.Samples.Max(x => x.Timestamp);
+            }
+
+            var labels = doc.Labels
+                .Select(x => new KeyValuePair<string, string>(x.Name, x.Value))
+                .ToArray();
+
+            return new TimeSeriesInfoResult(
+                TimeSeriesResultStatus.Ok,
+                doc.Samples.Count,
+                firstTimestamp,
+                lastTimestamp,
+                doc.RetentionTimeMs,
+                doc.DuplicatePolicy,
+                labels);
+        }
+
+        private async Task<TimeSeriesMRangeResult> TimeSeriesMultiRangeCoreAsync(long fromTimestamp, long toTimestamp, bool reverse, int? count, string? aggregationType, long? bucketDurationMs, KeyValuePair<string, string>[] filters, CancellationToken token)
+        {
+            if (fromTimestamp > toTimestamp || (count.HasValue && count.Value < 0) || filters.Length == 0)
+            {
+                return new TimeSeriesMRangeResult(TimeSeriesResultStatus.InvalidArgument, Array.Empty<TimeSeriesMRangeEntry>());
+            }
+
+            if (!TryNormalizeTimeSeriesAggregation(aggregationType, out var normalizedAggregation))
+            {
+                return new TimeSeriesMRangeResult(TimeSeriesResultStatus.InvalidArgument, Array.Empty<TimeSeriesMRangeEntry>());
+            }
+
+            if (normalizedAggregation != null && (!bucketDurationMs.HasValue || bucketDurationMs.Value <= 0))
+            {
+                return new TimeSeriesMRangeResult(TimeSeriesResultStatus.InvalidArgument, Array.Empty<TimeSeriesMRangeEntry>());
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            var docs = await timeSeriesCollection.Find(ActiveTimeSeriesFilter(nowUtc)).ToListAsync(token);
+            var entries = new List<TimeSeriesMRangeEntry>();
+            foreach (var doc in docs)
+            {
+                if (!HasAllTimeSeriesLabels(doc, filters))
+                {
+                    continue;
+                }
+
+                var samples = GetTimeSeriesSamplesInRange(doc.Samples, fromTimestamp, toTimestamp);
+                if (normalizedAggregation != null)
+                {
+                    samples = AggregateTimeSeriesSamples(samples, bucketDurationMs!.Value, normalizedAggregation);
+                }
+
+                if (reverse)
+                {
+                    Array.Reverse(samples);
+                }
+
+                if (count.HasValue)
+                {
+                    samples = samples.Take(count.Value).ToArray();
+                }
+
+                var labels = doc.Labels
+                    .Select(x => new KeyValuePair<string, string>(x.Name, x.Value))
+                    .ToArray();
+                entries.Add(new TimeSeriesMRangeEntry(doc.Key, labels, samples));
+            }
+
+            var ordered = entries
+                .OrderBy(x => x.Key, StringComparer.Ordinal)
+                .ToArray();
+
+            return new TimeSeriesMRangeResult(TimeSeriesResultStatus.Ok, ordered);
+        }
+
+        private static bool TryNormalizeTimeSeriesAggregation(string? aggregationType, out string? normalized)
+        {
+            if (string.IsNullOrWhiteSpace(aggregationType))
+            {
+                normalized = null;
+                return true;
+            }
+
+            normalized = aggregationType.Trim().ToUpperInvariant();
+            return normalized is "AVG" or "SUM" or "MIN" or "MAX" or "COUNT";
+        }
+
+        private static void PruneTimeSeriesRetention(List<TimeSeriesSampleDocument> samples, long retentionTimeMs, long referenceTimestamp)
+        {
+            if (retentionTimeMs <= 0)
+            {
+                return;
+            }
+
+            var minimumTimestamp = referenceTimestamp - retentionTimeMs;
+            samples.RemoveAll(x => x.Timestamp < minimumTimestamp);
+        }
+
+        private static TimeSeriesSample[] GetTimeSeriesSamplesInRange(List<TimeSeriesSampleDocument> samples, long fromTimestamp, long toTimestamp)
+        {
+            return samples
+                .Where(x => x.Timestamp >= fromTimestamp && x.Timestamp <= toTimestamp)
+                .OrderBy(x => x.Timestamp)
+                .Select(x => new TimeSeriesSample(x.Timestamp, x.Value))
+                .ToArray();
+        }
+
+        private static TimeSeriesSample[] AggregateTimeSeriesSamples(TimeSeriesSample[] samples, long bucketDurationMs, string aggregation)
+        {
+            if (samples.Length == 0)
+            {
+                return Array.Empty<TimeSeriesSample>();
+            }
+
+            var grouped = samples
+                .GroupBy(x => (x.Timestamp / bucketDurationMs) * bucketDurationMs)
+                .OrderBy(x => x.Key);
+
+            var output = new List<TimeSeriesSample>();
+            foreach (var bucket in grouped)
+            {
+                double value;
+                switch (aggregation)
+                {
+                    case "AVG":
+                        value = bucket.Average(x => x.Value);
+                        break;
+                    case "SUM":
+                        value = bucket.Sum(x => x.Value);
+                        break;
+                    case "MIN":
+                        value = bucket.Min(x => x.Value);
+                        break;
+                    case "MAX":
+                        value = bucket.Max(x => x.Value);
+                        break;
+                    default:
+                        value = bucket.Count();
+                        break;
+                }
+
+                output.Add(new TimeSeriesSample(bucket.Key, value));
+            }
+
+            return output.ToArray();
+        }
+
+        private static bool HasAllTimeSeriesLabels(TimeSeriesDocument doc, KeyValuePair<string, string>[] filters)
+        {
+            if (filters.Length == 0)
+            {
+                return true;
+            }
+
+            var labels = new Dictionary<string, string>(StringComparer.Ordinal);
+            for (int i = 0; i < doc.Labels.Count; i++)
+            {
+                labels[doc.Labels[i].Name] = doc.Labels[i].Value;
+            }
+
+            for (int i = 0; i < filters.Length; i++)
+            {
+                if (!labels.TryGetValue(filters[i].Key, out var value) || !string.Equals(value, filters[i].Value, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private async Task<ProbabilisticResultStatus> TopKReserveCoreAsync(string key, int k, int width, int depth, double decay, CancellationToken token)

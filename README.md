@@ -70,6 +70,11 @@ This package currently implements the following `IKeyValueStore` areas:
 - **Vectors**
   - `VSET`, `VGET`, `VDIM`, `VDEL`, `VSIM`, `VSEARCH`
 
+- **TimeSeries**
+  - `TS.CREATE`, `TS.ADD`, `TS.INCRBY`, `TS.DECRBY`, `TS.GET`
+  - `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`
+  - `TS.DEL`, `TS.INFO`
+
 ## Quick start
 
 ```csharp
@@ -96,9 +101,9 @@ The `collectionName` value is used as a prefix for type-specific collections (fo
 
 ## Notes
 
-- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest/topk/vector values.
+- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest/topk/vector/timeseries values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
-- Remaining `IKeyValueStore` areas (JSON, TimeSeries, etc.) are still pending.
+- Remaining `IKeyValueStore` areas (JSON, etc.) are still pending.
 
 ## Third-party notice
 
