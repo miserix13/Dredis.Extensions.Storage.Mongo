@@ -119,6 +119,15 @@ The `collectionName` value is used as a prefix for type-specific collections (fo
 - Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest/topk/vector/timeseries/json values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
 
+## Publishing to NuGet
+
+This repository includes a GitHub Actions workflow at `.github/workflows/publish-nuget.yml`.
+
+- Triggers on published GitHub releases, version tags (`v*`), and manual dispatch.
+- Builds, tests, packs, and publishes `Dredis.Extensions.Storage.Mongo` to NuGet.
+- Uses NuGet Trusted Publishing (OIDC) via `NuGet/login@v1`; no long-lived NuGet API key is required.
+- Requires a Trusted Publishing policy on nuget.org for this repository and workflow file (`publish-nuget.yml`).
+
 ## Third-party notice
 
 - This project depends on the MongoDB .NET/C# Driver (`MongoDB.Driver`).
