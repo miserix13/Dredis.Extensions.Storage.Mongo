@@ -4,22 +4,20 @@ using MongoDB.Driver;
 
 namespace Dredis.Extensions.Storage.Mongo
 {
-    public class MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis") : IKeyValueStore
+    public class MongoKeyValueStore : IKeyValueStore
     {
 
-        private readonly IMongoDatabase database = mongoClient.GetDatabase(databaseName);
+        private readonly IMongoDatabase database;
         private readonly IMongoCollection<KeyValueDocument> collection;
 
-        public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis") : this(mongoClient, databaseName, null) { }
-
-        public MongoKeyValueStore(MongoClient mongoClient, string databaseName, string? collectionName = null) : this(mongoClient)
+        public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
-            database = mongoClient.GetDatabase(databaseName);
-            collection = database.GetCollection<KeyValueDocument>(collectionName ?? "kvstore");
+            this.database = mongoClient.GetDatabase(databaseName);
+            this.collection = this.database.GetCollection<KeyValueDocument>(collectionName ?? "kvstore");
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
-            collection.Indexes.CreateOne(indexModel);
+            this.collection.Indexes.CreateOne(indexModel);
         }
 
         private class KeyValueDocument
@@ -45,13 +43,13 @@ namespace Dredis.Extensions.Storage.Mongo
             {
                 // Only insert if not exists
                 var doc = new KeyValueDocument { Key = key, Value = value, ExpireAt = expiration.HasValue ? DateTime.UtcNow.Add(expiration.Value) : null };
-                var result = await collection.InsertOneAsync(doc, null, token);
+                await this.collection.InsertOneAsync(doc, null, token);
                 return true;
             }
             else if (condition == SetCondition.Xx)
             {
                 // Only update if exists
-                var updateResult = await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = false }, token);
+                var updateResult = await this.collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = false }, token);
                 return updateResult.ModifiedCount > 0;
             }
             else
@@ -166,31 +164,6 @@ namespace Dredis.Extensions.Storage.Mongo
         }
 
         public Task<ProbabilisticResultStatus> CuckooReserveAsync(string key, long capacity, CancellationToken token = default)
-        {
-            throw new NotImplementedException();
-        }
-
-        public Task<long> DeleteAsync(string[] keys, CancellationToken token = default)
-        {
-            throw new NotImplementedException();
-        }
-
-        public Task<bool> ExistsAsync(string key, CancellationToken token = default)
-        {
-            throw new NotImplementedException();
-        }
-
-        public Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
-        {
-            throw new NotImplementedException();
-        }
-
-        public Task<bool> ExpireAsync(string key, TimeSpan expiration, CancellationToken token = default)
-        {
-            throw new NotImplementedException();
-        }
-
-        public Task<byte[]?> GetAsync(string key, CancellationToken token = default)
         {
             throw new NotImplementedException();
         }
@@ -346,11 +319,6 @@ namespace Dredis.Extensions.Storage.Mongo
         }
 
         public Task<SetCountResult> SetAddAsync(string key, byte[][] members, CancellationToken token = default)
-        {
-            throw new NotImplementedException();
-        }
-
-        public async Task<bool> SetAsync(string key, byte[] value, TimeSpan? expiration, SetCondition condition, CancellationToken token = default)
         {
             throw new NotImplementedException();
         }
