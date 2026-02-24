@@ -75,6 +75,21 @@ This package currently implements the following `IKeyValueStore` areas:
   - `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`
   - `TS.DEL`, `TS.INFO`
 
+- **JSON**
+  - `JSON.SET` (`JsonSetAsync`)
+  - `JSON.GET` (`JsonGetAsync`) with multi-path support
+  - `JSON.DEL` (`JsonDelAsync`)
+  - `JSON.TYPE` (`JsonTypeAsync`)
+  - `JSON.STRLEN` (`JsonStrlenAsync`)
+  - `JSON.ARRLEN` (`JsonArrlenAsync`)
+  - `JSON.ARRAPPEND` (`JsonArrappendAsync`)
+  - `JSON.ARRINDEX` (`JsonArrindexAsync`)
+  - `JSON.ARRINSERT` (`JsonArrinsertAsync`)
+  - `JSON.ARRREM` (`JsonArrremAsync`)
+  - `JSON.ARRTRIM` (`JsonArrtrimAsync`)
+  - `JSON.MGET` (`JsonMgetAsync`)
+  - Full JSONPath support: `$`, `.property`, `[n]`, `.*`, `[*]` syntax
+
 ## Quick start
 
 ```csharp
@@ -101,9 +116,8 @@ The `collectionName` value is used as a prefix for type-specific collections (fo
 
 ## Notes
 
-- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest/topk/vector/timeseries values.
+- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest/topk/vector/timeseries/json values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
-- Remaining `IKeyValueStore` areas (JSON, etc.) are still pending.
 
 ## Third-party notice
 
