@@ -51,6 +51,12 @@ This package currently implements the following `IKeyValueStore` areas:
 - **HyperLogLog**
   - `PFADD`, `PFCOUNT`, `PFMERGE`
 
+- **Bloom filter**
+  - `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.EXISTS`, `BF.MEXISTS`, `BF.INFO`
+
+- **Cuckoo filter**
+  - `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`, `CF.EXISTS`, `CF.DEL`, `CF.COUNT`, `CF.INFO`
+
 ## Quick start
 
 ```csharp
@@ -77,9 +83,9 @@ The `collectionName` value is used as a prefix for type-specific collections (fo
 
 ## Notes
 
-- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream values.
+- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
-- Remaining `IKeyValueStore` areas (JSON, remaining Probabilistic structures, Vector, TimeSeries, TopK, TDigest, etc.) are still pending.
+- Remaining `IKeyValueStore` areas (JSON, Vector, TimeSeries, TopK, TDigest, etc.) are still pending.
 
 ## Third-party notice
 

@@ -2,6 +2,7 @@
 using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Dredis.Extensions.Storage.Mongo
@@ -17,6 +18,8 @@ namespace Dredis.Extensions.Storage.Mongo
     private readonly IMongoCollection<SortedSetDocument> sortedSetCollection;
     private readonly IMongoCollection<StreamDocument> streamCollection;
     private readonly IMongoCollection<HyperLogLogDocument> hyperLogLogCollection;
+    private readonly IMongoCollection<BloomDocument> bloomCollection;
+    private readonly IMongoCollection<CuckooDocument> cuckooCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -28,6 +31,8 @@ namespace Dredis.Extensions.Storage.Mongo
             this.sortedSetCollection = this.database.GetCollection<SortedSetDocument>($"{collectionName ?? "kvstore"}_zset");
             this.streamCollection = this.database.GetCollection<StreamDocument>($"{collectionName ?? "kvstore"}_stream");
             this.hyperLogLogCollection = this.database.GetCollection<HyperLogLogDocument>($"{collectionName ?? "kvstore"}_hll");
+            this.bloomCollection = this.database.GetCollection<BloomDocument>($"{collectionName ?? "kvstore"}_bloom");
+            this.cuckooCollection = this.database.GetCollection<CuckooDocument>($"{collectionName ?? "kvstore"}_cuckoo");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -57,6 +62,14 @@ namespace Dredis.Extensions.Storage.Mongo
             var hllKeyIndexModel = new CreateIndexModel<HyperLogLogDocument>(hllKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.hyperLogLogCollection.Indexes.CreateOne(hllKeyIndexModel);
 
+            var bloomKeyIndexKeys = Builders<BloomDocument>.IndexKeys.Ascending(x => x.Key);
+            var bloomKeyIndexModel = new CreateIndexModel<BloomDocument>(bloomKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.bloomCollection.Indexes.CreateOne(bloomKeyIndexModel);
+
+            var cuckooKeyIndexKeys = Builders<CuckooDocument>.IndexKeys.Ascending(x => x.Key);
+            var cuckooKeyIndexModel = new CreateIndexModel<CuckooDocument>(cuckooKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.cuckooCollection.Indexes.CreateOne(cuckooKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -85,6 +98,14 @@ namespace Dredis.Extensions.Storage.Mongo
             var hllTtlIndexKeys = Builders<HyperLogLogDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var hllTtlIndexModel = new CreateIndexModel<HyperLogLogDocument>(hllTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.hyperLogLogCollection.Indexes.CreateOne(hllTtlIndexModel);
+
+            var bloomTtlIndexKeys = Builders<BloomDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var bloomTtlIndexModel = new CreateIndexModel<BloomDocument>(bloomTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.bloomCollection.Indexes.CreateOne(bloomTtlIndexModel);
+
+            var cuckooTtlIndexKeys = Builders<CuckooDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var cuckooTtlIndexModel = new CreateIndexModel<CuckooDocument>(cuckooTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.cuckooCollection.Indexes.CreateOne(cuckooTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -206,6 +227,35 @@ namespace Dredis.Extensions.Storage.Mongo
             public DateTime? ExpireAt { get; set; }
         }
 
+        private class BloomDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public double ErrorRate { get; set; }
+            public long Capacity { get; set; }
+            public int HashFunctions { get; set; }
+            public long BitSize { get; set; }
+            public byte[] Bits { get; set; } = Array.Empty<byte>();
+            public long ItemsInserted { get; set; }
+            public DateTime? ExpireAt { get; set; }
+        }
+
+        private class CuckooItemDocument
+        {
+            public string ItemKey { get; set; } = null!;
+            public byte[] Item { get; set; } = null!;
+            public long Count { get; set; }
+        }
+
+        private class CuckooDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public long Capacity { get; set; }
+            public List<CuckooItemDocument> Items { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
         private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
 
         private static FilterDefinition<KeyValueDocument> ActiveFilter(DateTime nowUtc) =>
@@ -306,6 +356,36 @@ namespace Dredis.Extensions.Storage.Mongo
                 Builders<HyperLogLogDocument>.Filter.In(x => x.Key, keys),
                 ActiveHyperLogLogFilter(nowUtc));
 
+        private FilterDefinition<BloomDocument> BloomKeyFilter(string key) => Builders<BloomDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<BloomDocument> ActiveBloomFilter(DateTime nowUtc) =>
+            Builders<BloomDocument>.Filter.Or(
+                Builders<BloomDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<BloomDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<BloomDocument> ActiveBloomKeyFilter(string key, DateTime nowUtc) =>
+            Builders<BloomDocument>.Filter.And(BloomKeyFilter(key), ActiveBloomFilter(nowUtc));
+
+        private FilterDefinition<BloomDocument> ActiveBloomKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<BloomDocument>.Filter.And(
+                Builders<BloomDocument>.Filter.In(x => x.Key, keys),
+                ActiveBloomFilter(nowUtc));
+
+        private FilterDefinition<CuckooDocument> CuckooKeyFilter(string key) => Builders<CuckooDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<CuckooDocument> ActiveCuckooFilter(DateTime nowUtc) =>
+            Builders<CuckooDocument>.Filter.Or(
+                Builders<CuckooDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<CuckooDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<CuckooDocument> ActiveCuckooKeyFilter(string key, DateTime nowUtc) =>
+            Builders<CuckooDocument>.Filter.And(CuckooKeyFilter(key), ActiveCuckooFilter(nowUtc));
+
+        private FilterDefinition<CuckooDocument> ActiveCuckooKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<CuckooDocument>.Filter.And(
+                Builders<CuckooDocument>.Filter.In(x => x.Key, keys),
+                ActiveCuckooFilter(nowUtc));
+
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
                 Builders<HashDocument>.Filter.In(x => x.Key, keys),
@@ -383,7 +463,11 @@ namespace Dredis.Extensions.Storage.Mongo
             var streamResult = await streamCollection.DeleteManyAsync(streamFilter, token);
             var hllFilter = Builders<HyperLogLogDocument>.Filter.In(x => x.Key, keys);
             var hllResult = await hyperLogLogCollection.DeleteManyAsync(hllFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount;
+            var bloomFilter = Builders<BloomDocument>.Filter.In(x => x.Key, keys);
+            var bloomResult = await bloomCollection.DeleteManyAsync(bloomFilter, token);
+            var cuckooFilter = Builders<CuckooDocument>.Filter.In(x => x.Key, keys);
+            var cuckooResult = await cuckooCollection.DeleteManyAsync(cuckooFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -426,7 +510,19 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var hllCount = await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token);
-            return hllCount > 0;
+            if (hllCount > 0)
+            {
+                return true;
+            }
+
+            var bloomCount = await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token);
+            if (bloomCount > 0)
+            {
+                return true;
+            }
+
+            var cuckooCount = await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token);
+            return cuckooCount > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -481,6 +577,18 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var bloomKeys = await bloomCollection.Find(ActiveBloomKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in bloomKeys)
+            {
+                keySet.Add(item);
+            }
+
+            var cuckooKeys = await cuckooCollection.Find(ActiveCuckooKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in cuckooKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -497,6 +605,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await sortedSetCollection.DeleteOneAsync(ActiveSortedSetKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await streamCollection.DeleteOneAsync(ActiveStreamKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await hyperLogLogCollection.DeleteOneAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await bloomCollection.DeleteOneAsync(ActiveBloomKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await cuckooCollection.DeleteOneAsync(ActiveCuckooKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -553,37 +663,53 @@ namespace Dredis.Extensions.Storage.Mongo
             var hllFilter = ActiveHyperLogLogKeyFilter(key, nowUtc);
             var hllUpdate = Builders<HyperLogLogDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var hllResult = await hyperLogLogCollection.UpdateOneAsync(hllFilter, hllUpdate, null, token);
-            return hllResult.MatchedCount > 0;
+            if (hllResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var bloomFilter = ActiveBloomKeyFilter(key, nowUtc);
+            var bloomUpdate = Builders<BloomDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var bloomResult = await bloomCollection.UpdateOneAsync(bloomFilter, bloomUpdate, null, token);
+            if (bloomResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var cuckooFilter = ActiveCuckooKeyFilter(key, nowUtc);
+            var cuckooUpdate = Builders<CuckooDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var cuckooResult = await cuckooCollection.UpdateOneAsync(cuckooFilter, cuckooUpdate, null, token);
+            return cuckooResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return BloomAddCoreAsync(key, element, token);
         }
 
         public Task<ProbabilisticBoolResult> BloomExistsAsync(string key, byte[] element, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return BloomExistsCoreAsync(key, element, token);
         }
 
         public Task<ProbabilisticInfoResult> BloomInfoAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return BloomInfoCoreAsync(key, token);
         }
 
         public Task<ProbabilisticArrayResult> BloomMAddAsync(string key, byte[][] elements, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return BloomMAddCoreAsync(key, elements, token);
         }
 
         public Task<ProbabilisticArrayResult> BloomMExistsAsync(string key, byte[][] elements, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return BloomMExistsCoreAsync(key, elements, token);
         }
 
         public Task<ProbabilisticResultStatus> BloomReserveAsync(string key, double errorRate, long capacity, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return BloomReserveCoreAsync(key, errorRate, capacity, token);
         }
 
         public Task<long> CleanUpExpiredKeysAsync(CancellationToken token = default)
@@ -593,37 +719,37 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<ProbabilisticBoolResult> CuckooAddAsync(string key, byte[] item, bool noCreate, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return CuckooAddCoreAsync(key, item, noCreate, nx: false, token);
         }
 
         public Task<ProbabilisticBoolResult> CuckooAddNxAsync(string key, byte[] item, bool noCreate, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return CuckooAddCoreAsync(key, item, noCreate, nx: true, token);
         }
 
         public Task<ProbabilisticCountResult> CuckooCountAsync(string key, byte[] item, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return CuckooCountCoreAsync(key, item, token);
         }
 
         public Task<ProbabilisticBoolResult> CuckooDeleteAsync(string key, byte[] item, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return CuckooDeleteCoreAsync(key, item, token);
         }
 
         public Task<ProbabilisticBoolResult> CuckooExistsAsync(string key, byte[] item, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return CuckooExistsCoreAsync(key, item, token);
         }
 
         public Task<ProbabilisticInfoResult> CuckooInfoAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return CuckooInfoCoreAsync(key, token);
         }
 
         public Task<ProbabilisticResultStatus> CuckooReserveAsync(string key, long capacity, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return CuckooReserveCoreAsync(key, capacity, token);
         }
 
         public Task<byte[]?[]> GetManyAsync(string[] keys, CancellationToken token = default)
@@ -1148,7 +1274,11 @@ namespace Dredis.Extensions.Storage.Mongo
             var streamResult = await streamCollection.DeleteManyAsync(streamFilter, token);
             var hllFilter = Builders<HyperLogLogDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var hllResult = await hyperLogLogCollection.DeleteManyAsync(hllFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount;
+            var bloomFilter = Builders<BloomDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var bloomResult = await bloomCollection.DeleteManyAsync(bloomFilter, token);
+            var cuckooFilter = Builders<CuckooDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var cuckooResult = await cuckooCollection.DeleteManyAsync(cuckooFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -1318,6 +1448,40 @@ namespace Dredis.Extensions.Storage.Mongo
                 return (long)(hllDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
+            var bloomDoc = await bloomCollection.Find(BloomKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (bloomDoc != null)
+            {
+                if (!bloomDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (bloomDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await bloomCollection.DeleteOneAsync(BloomKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(bloomDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
+            var cuckooDoc = await cuckooCollection.Find(CuckooKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (cuckooDoc != null)
+            {
+                if (!cuckooDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (cuckooDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await cuckooCollection.DeleteOneAsync(CuckooKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(cuckooDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
             return -2;
         }
 
@@ -1340,7 +1504,9 @@ namespace Dredis.Extensions.Storage.Mongo
                 await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0 ||
                 await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0 ||
                 await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0 ||
-                await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+                await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0 ||
+                await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0 ||
+                await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1549,10 +1715,101 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var hllCount = await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token);
-            return hllCount > 0;
+            if (hllCount > 0)
+            {
+                return true;
+            }
+
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
+
+        private static ulong ToUInt64(byte[] data, int offset)
+        {
+            return ((ulong)data[offset] << 56) |
+                   ((ulong)data[offset + 1] << 48) |
+                   ((ulong)data[offset + 2] << 40) |
+                   ((ulong)data[offset + 3] << 32) |
+                   ((ulong)data[offset + 4] << 24) |
+                   ((ulong)data[offset + 5] << 16) |
+                   ((ulong)data[offset + 6] << 8) |
+                   data[offset + 7];
+        }
+
+        private static void GetHashPair(byte[] value, out ulong hash1, out ulong hash2)
+        {
+            var digest = SHA256.HashData(value);
+            hash1 = ToUInt64(digest, 0);
+            hash2 = ToUInt64(digest, 8);
+            if (hash2 == 0)
+            {
+                hash2 = 0x9e3779b97f4a7c15UL;
+            }
+        }
+
+        private static bool TryComputeBloomSizing(double errorRate, long capacity, out long bitSize, out int hashFunctions)
+        {
+            bitSize = 0;
+            hashFunctions = 0;
+            if (capacity <= 0 || errorRate <= 0 || errorRate >= 1)
+            {
+                return false;
+            }
+
+            var ln2 = Math.Log(2);
+            var m = -(capacity * Math.Log(errorRate)) / (ln2 * ln2);
+            if (double.IsNaN(m) || double.IsInfinity(m) || m <= 0)
+            {
+                return false;
+            }
+
+            bitSize = Math.Max(64, (long)Math.Ceiling(m));
+            var k = (bitSize / (double)capacity) * ln2;
+            hashFunctions = Math.Max(1, (int)Math.Round(k));
+            return true;
+        }
+
+        private static bool SetBloomBitsAndReturnChanged(BloomDocument doc, byte[] value)
+        {
+            GetHashPair(value, out var hash1, out var hash2);
+            var changed = false;
+            for (int i = 0; i < doc.HashFunctions; i++)
+            {
+                var bitIndex = (long)((hash1 + ((ulong)i * hash2)) % (ulong)doc.BitSize);
+                var byteIndex = (int)(bitIndex / 8);
+                var mask = (byte)(1 << (int)(bitIndex % 8));
+                if ((doc.Bits[byteIndex] & mask) == 0)
+                {
+                    doc.Bits[byteIndex] |= mask;
+                    changed = true;
+                }
+            }
+
+            return changed;
+        }
+
+        private static bool BloomMayContain(BloomDocument doc, byte[] value)
+        {
+            GetHashPair(value, out var hash1, out var hash2);
+            for (int i = 0; i < doc.HashFunctions; i++)
+            {
+                var bitIndex = (long)((hash1 + ((ulong)i * hash2)) % (ulong)doc.BitSize);
+                var byteIndex = (int)(bitIndex / 8);
+                var mask = (byte)(1 << (int)(bitIndex % 8));
+                if ((doc.Bits[byteIndex] & mask) == 0)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
 
         private static List<SortedSetMemberDocument> SortSortedSetMembers(IEnumerable<SortedSetMemberDocument> members)
         {
@@ -1589,6 +1846,16 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
             return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
         }
 
@@ -1615,6 +1882,16 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return true;
             }
@@ -1745,6 +2022,16 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
             return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
         }
 
@@ -1775,7 +2062,97 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
             return await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsBloomWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsCuckooWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<HyperLogLogAddResult> HyperLogLogAddCoreAsync(string key, byte[][] elements, CancellationToken token)
@@ -1945,6 +2322,405 @@ namespace Dredis.Extensions.Storage.Mongo
             destination.Members = merged.Select(x => new HyperLogLogMemberDocument { MemberKey = x.Key, Member = x.Value }).ToList();
             await hyperLogLogCollection.ReplaceOneAsync(Builders<HyperLogLogDocument>.Filter.Eq(x => x.Id, destination.Id), destination, new ReplaceOptions(), token);
             return new HyperLogLogMergeResult(HyperLogLogResultStatus.Ok);
+        }
+
+        private async Task<ProbabilisticResultStatus> BloomReserveCoreAsync(string key, double errorRate, long capacity, CancellationToken token)
+        {
+            if (!TryComputeBloomSizing(errorRate, capacity, out var bitSize, out var hashFunctions))
+            {
+                return ProbabilisticResultStatus.InvalidArgument;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsBloomWrongTypeAsync(key, nowUtc, token))
+            {
+                return ProbabilisticResultStatus.WrongType;
+            }
+
+            var existing = await bloomCollection.Find(ActiveBloomKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (existing != null)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+
+            var byteSize = checked((int)((bitSize + 7) / 8));
+            var created = new BloomDocument
+            {
+                Key = key,
+                ErrorRate = errorRate,
+                Capacity = capacity,
+                HashFunctions = hashFunctions,
+                BitSize = bitSize,
+                Bits = new byte[byteSize],
+                ItemsInserted = 0,
+                ExpireAt = null
+            };
+
+            try
+            {
+                await bloomCollection.InsertOneAsync(created, null, token);
+                return ProbabilisticResultStatus.Ok;
+            }
+            catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+        }
+
+        private async Task<ProbabilisticBoolResult> BloomAddCoreAsync(string key, byte[] element, CancellationToken token)
+        {
+            var result = await BloomMAddCoreAsync(key, new[] { element }, token);
+            if (result.Status != ProbabilisticResultStatus.Ok)
+            {
+                return new ProbabilisticBoolResult(result.Status, false);
+            }
+
+            return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, result.Values.Length > 0 && result.Values[0] != 0);
+        }
+
+        private async Task<ProbabilisticArrayResult> BloomMAddCoreAsync(string key, byte[][] elements, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsBloomWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<long>());
+            }
+
+            if (elements.Length == 0)
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, Array.Empty<long>());
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await bloomCollection.Find(ActiveBloomKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    if (!TryComputeBloomSizing(0.01, 1000, out var bitSize, out var hashFunctions))
+                    {
+                        return new ProbabilisticArrayResult(ProbabilisticResultStatus.InvalidArgument, Array.Empty<long>());
+                    }
+
+                    doc = new BloomDocument
+                    {
+                        Key = key,
+                        ErrorRate = 0.01,
+                        Capacity = 1000,
+                        HashFunctions = hashFunctions,
+                        BitSize = bitSize,
+                        Bits = new byte[checked((int)((bitSize + 7) / 8))],
+                        ItemsInserted = 0,
+                        ExpireAt = null
+                    };
+
+                    try
+                    {
+                        await bloomCollection.InsertOneAsync(doc, null, token);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                var values = new long[elements.Length];
+                var changedAny = false;
+                for (int i = 0; i < elements.Length; i++)
+                {
+                    var changed = SetBloomBitsAndReturnChanged(doc, elements[i]);
+                    values[i] = changed ? 1 : 0;
+                    if (changed)
+                    {
+                        changedAny = true;
+                        doc.ItemsInserted++;
+                    }
+                }
+
+                if (changedAny)
+                {
+                    var replaced = await bloomCollection.ReplaceOneAsync(
+                        Builders<BloomDocument>.Filter.Eq(x => x.Id, doc.Id),
+                        doc,
+                        new ReplaceOptions(),
+                        token);
+                    if (replaced.MatchedCount == 0)
+                    {
+                        continue;
+                    }
+                }
+
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, values);
+            }
+
+            return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, Array.Empty<long>());
+        }
+
+        private async Task<ProbabilisticBoolResult> BloomExistsCoreAsync(string key, byte[] element, CancellationToken token)
+        {
+            var result = await BloomMExistsCoreAsync(key, new[] { element }, token);
+            if (result.Status != ProbabilisticResultStatus.Ok)
+            {
+                return new ProbabilisticBoolResult(result.Status, false);
+            }
+
+            return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, result.Values.Length > 0 && result.Values[0] != 0);
+        }
+
+        private async Task<ProbabilisticArrayResult> BloomMExistsCoreAsync(string key, byte[][] elements, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsBloomWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<long>());
+            }
+
+            if (elements.Length == 0)
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, Array.Empty<long>());
+            }
+
+            var doc = await bloomCollection.Find(ActiveBloomKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, new long[elements.Length]);
+            }
+
+            var values = new long[elements.Length];
+            for (int i = 0; i < elements.Length; i++)
+            {
+                values[i] = BloomMayContain(doc, elements[i]) ? 1 : 0;
+            }
+
+            return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private async Task<ProbabilisticInfoResult> BloomInfoCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsBloomWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.WrongType, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var doc = await bloomCollection.Find(ActiveBloomKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.NotFound, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var values = new[]
+            {
+                new KeyValuePair<string, string>("Capacity", doc.Capacity.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Size", doc.BitSize.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Number of filters", "1"),
+                new KeyValuePair<string, string>("Number of items inserted", doc.ItemsInserted.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Expansion rate", "2")
+            };
+
+            return new ProbabilisticInfoResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private async Task<ProbabilisticResultStatus> CuckooReserveCoreAsync(string key, long capacity, CancellationToken token)
+        {
+            if (capacity <= 0)
+            {
+                return ProbabilisticResultStatus.InvalidArgument;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsCuckooWrongTypeAsync(key, nowUtc, token))
+            {
+                return ProbabilisticResultStatus.WrongType;
+            }
+
+            var existing = await cuckooCollection.Find(ActiveCuckooKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (existing != null)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+
+            var created = new CuckooDocument { Key = key, Capacity = capacity, ExpireAt = null, Items = new List<CuckooItemDocument>() };
+            try
+            {
+                await cuckooCollection.InsertOneAsync(created, null, token);
+                return ProbabilisticResultStatus.Ok;
+            }
+            catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+        }
+
+        private async Task<ProbabilisticBoolResult> CuckooAddCoreAsync(string key, byte[] item, bool noCreate, bool nx, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsCuckooWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticBoolResult(ProbabilisticResultStatus.WrongType, false);
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await cuckooCollection.Find(ActiveCuckooKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    if (noCreate)
+                    {
+                        return new ProbabilisticBoolResult(ProbabilisticResultStatus.NotFound, false);
+                    }
+
+                    try
+                    {
+                        doc = new CuckooDocument { Key = key, Capacity = 1024, ExpireAt = null, Items = new List<CuckooItemDocument>() };
+                        await cuckooCollection.InsertOneAsync(doc, null, token);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                var itemKey = ToMemberKey(item);
+                var existing = doc.Items.FirstOrDefault(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal));
+                if (existing == null)
+                {
+                    doc.Items.Add(new CuckooItemDocument { ItemKey = itemKey, Item = item, Count = 1 });
+                }
+                else
+                {
+                    if (nx)
+                    {
+                        return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, false);
+                    }
+
+                    existing.Count++;
+                }
+
+                var replaced = await cuckooCollection.ReplaceOneAsync(
+                    Builders<CuckooDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+                if (replaced.MatchedCount > 0)
+                {
+                    return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, true);
+                }
+            }
+
+            return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, false);
+        }
+
+        private async Task<ProbabilisticBoolResult> CuckooExistsCoreAsync(string key, byte[] item, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsCuckooWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticBoolResult(ProbabilisticResultStatus.WrongType, false);
+            }
+
+            var doc = await cuckooCollection.Find(ActiveCuckooKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, false);
+            }
+
+            var itemKey = ToMemberKey(item);
+            var exists = doc.Items.Any(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal) && x.Count > 0);
+            return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, exists);
+        }
+
+        private async Task<ProbabilisticBoolResult> CuckooDeleteCoreAsync(string key, byte[] item, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsCuckooWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticBoolResult(ProbabilisticResultStatus.WrongType, false);
+            }
+
+            var doc = await cuckooCollection.Find(ActiveCuckooKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, false);
+            }
+
+            var itemKey = ToMemberKey(item);
+            var existing = doc.Items.FirstOrDefault(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal));
+            if (existing == null || existing.Count <= 0)
+            {
+                return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, false);
+            }
+
+            existing.Count--;
+            if (existing.Count <= 0)
+            {
+                doc.Items.RemoveAll(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal));
+            }
+
+            if (doc.Items.Count == 0)
+            {
+                await cuckooCollection.DeleteOneAsync(Builders<CuckooDocument>.Filter.Eq(x => x.Id, doc.Id), token);
+            }
+            else
+            {
+                await cuckooCollection.ReplaceOneAsync(
+                    Builders<CuckooDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+            }
+
+            return new ProbabilisticBoolResult(ProbabilisticResultStatus.Ok, true);
+        }
+
+        private async Task<ProbabilisticCountResult> CuckooCountCoreAsync(string key, byte[] item, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsCuckooWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticCountResult(ProbabilisticResultStatus.WrongType, 0);
+            }
+
+            var doc = await cuckooCollection.Find(ActiveCuckooKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticCountResult(ProbabilisticResultStatus.Ok, 0);
+            }
+
+            var itemKey = ToMemberKey(item);
+            var count = doc.Items.FirstOrDefault(x => string.Equals(x.ItemKey, itemKey, StringComparison.Ordinal))?.Count ?? 0;
+            return new ProbabilisticCountResult(ProbabilisticResultStatus.Ok, count);
+        }
+
+        private async Task<ProbabilisticInfoResult> CuckooInfoCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsCuckooWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.WrongType, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var doc = await cuckooCollection.Find(ActiveCuckooKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.NotFound, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var inserted = doc.Items.Sum(x => x.Count);
+            var values = new[]
+            {
+                new KeyValuePair<string, string>("Size", doc.Items.Count.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Number of buckets", doc.Capacity.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Number of items inserted", inserted.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Bucket size", "2"),
+                new KeyValuePair<string, string>("Max iterations", "20"),
+                new KeyValuePair<string, string>("Expansion rate", "1")
+            };
+
+            return new ProbabilisticInfoResult(ProbabilisticResultStatus.Ok, values);
         }
 
         private async Task<string?> StreamAddCoreAsync(string key, string id, KeyValuePair<string, byte[]>[] fields, CancellationToken token)
