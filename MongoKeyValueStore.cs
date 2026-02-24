@@ -20,6 +20,7 @@ namespace Dredis.Extensions.Storage.Mongo
     private readonly IMongoCollection<HyperLogLogDocument> hyperLogLogCollection;
     private readonly IMongoCollection<BloomDocument> bloomCollection;
     private readonly IMongoCollection<CuckooDocument> cuckooCollection;
+    private readonly IMongoCollection<TDigestDocument> tdigestCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -33,6 +34,7 @@ namespace Dredis.Extensions.Storage.Mongo
             this.hyperLogLogCollection = this.database.GetCollection<HyperLogLogDocument>($"{collectionName ?? "kvstore"}_hll");
             this.bloomCollection = this.database.GetCollection<BloomDocument>($"{collectionName ?? "kvstore"}_bloom");
             this.cuckooCollection = this.database.GetCollection<CuckooDocument>($"{collectionName ?? "kvstore"}_cuckoo");
+            this.tdigestCollection = this.database.GetCollection<TDigestDocument>($"{collectionName ?? "kvstore"}_tdigest");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -70,6 +72,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var cuckooKeyIndexModel = new CreateIndexModel<CuckooDocument>(cuckooKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.cuckooCollection.Indexes.CreateOne(cuckooKeyIndexModel);
 
+            var tdigestKeyIndexKeys = Builders<TDigestDocument>.IndexKeys.Ascending(x => x.Key);
+            var tdigestKeyIndexModel = new CreateIndexModel<TDigestDocument>(tdigestKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.tdigestCollection.Indexes.CreateOne(tdigestKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -106,6 +112,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var cuckooTtlIndexKeys = Builders<CuckooDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var cuckooTtlIndexModel = new CreateIndexModel<CuckooDocument>(cuckooTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.cuckooCollection.Indexes.CreateOne(cuckooTtlIndexModel);
+
+            var tdigestTtlIndexKeys = Builders<TDigestDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var tdigestTtlIndexModel = new CreateIndexModel<TDigestDocument>(tdigestTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.tdigestCollection.Indexes.CreateOne(tdigestTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -256,6 +266,15 @@ namespace Dredis.Extensions.Storage.Mongo
             public DateTime? ExpireAt { get; set; }
         }
 
+        private class TDigestDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public int Compression { get; set; }
+            public List<double> Values { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
         private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
 
         private static FilterDefinition<KeyValueDocument> ActiveFilter(DateTime nowUtc) =>
@@ -386,6 +405,21 @@ namespace Dredis.Extensions.Storage.Mongo
                 Builders<CuckooDocument>.Filter.In(x => x.Key, keys),
                 ActiveCuckooFilter(nowUtc));
 
+        private FilterDefinition<TDigestDocument> TDigestKeyFilter(string key) => Builders<TDigestDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<TDigestDocument> ActiveTDigestFilter(DateTime nowUtc) =>
+            Builders<TDigestDocument>.Filter.Or(
+                Builders<TDigestDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<TDigestDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<TDigestDocument> ActiveTDigestKeyFilter(string key, DateTime nowUtc) =>
+            Builders<TDigestDocument>.Filter.And(TDigestKeyFilter(key), ActiveTDigestFilter(nowUtc));
+
+        private FilterDefinition<TDigestDocument> ActiveTDigestKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<TDigestDocument>.Filter.And(
+                Builders<TDigestDocument>.Filter.In(x => x.Key, keys),
+                ActiveTDigestFilter(nowUtc));
+
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
                 Builders<HashDocument>.Filter.In(x => x.Key, keys),
@@ -467,7 +501,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var bloomResult = await bloomCollection.DeleteManyAsync(bloomFilter, token);
             var cuckooFilter = Builders<CuckooDocument>.Filter.In(x => x.Key, keys);
             var cuckooResult = await cuckooCollection.DeleteManyAsync(cuckooFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount;
+            var tdigestFilter = Builders<TDigestDocument>.Filter.In(x => x.Key, keys);
+            var tdigestResult = await tdigestCollection.DeleteManyAsync(tdigestFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -522,7 +558,12 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var cuckooCount = await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token);
-            return cuckooCount > 0;
+            if (cuckooCount > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -589,6 +630,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var tdigestKeys = await tdigestCollection.Find(ActiveTDigestKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in tdigestKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -607,6 +654,7 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await hyperLogLogCollection.DeleteOneAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await bloomCollection.DeleteOneAsync(ActiveBloomKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await cuckooCollection.DeleteOneAsync(ActiveCuckooKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await tdigestCollection.DeleteOneAsync(ActiveTDigestKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -679,7 +727,15 @@ namespace Dredis.Extensions.Storage.Mongo
             var cuckooFilter = ActiveCuckooKeyFilter(key, nowUtc);
             var cuckooUpdate = Builders<CuckooDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var cuckooResult = await cuckooCollection.UpdateOneAsync(cuckooFilter, cuckooUpdate, null, token);
-            return cuckooResult.MatchedCount > 0;
+            if (cuckooResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var tdigestFilter = ActiveTDigestKeyFilter(key, nowUtc);
+            var tdigestUpdate = Builders<TDigestDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var tdigestResult = await tdigestCollection.UpdateOneAsync(tdigestFilter, tdigestUpdate, null, token);
+            return tdigestResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -1084,67 +1140,67 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<ProbabilisticResultStatus> TDigestAddAsync(string key, double[] values, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestAddCoreAsync(key, values, token);
         }
 
         public Task<ProbabilisticDoubleArrayResult> TDigestByRankAsync(string key, long[] ranks, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestByRankCoreAsync(key, ranks, reverse: false, token);
         }
 
         public Task<ProbabilisticDoubleArrayResult> TDigestByRevRankAsync(string key, long[] ranks, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestByRankCoreAsync(key, ranks, reverse: true, token);
         }
 
         public Task<ProbabilisticDoubleArrayResult> TDigestCdfAsync(string key, double[] values, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestCdfCoreAsync(key, values, token);
         }
 
         public Task<ProbabilisticResultStatus> TDigestCreateAsync(string key, int compression, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestCreateCoreAsync(key, compression, token);
         }
 
         public Task<ProbabilisticInfoResult> TDigestInfoAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestInfoCoreAsync(key, token);
         }
 
         public Task<ProbabilisticDoubleResult> TDigestMaxAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestMinMaxCoreAsync(key, max: true, token);
         }
 
         public Task<ProbabilisticDoubleResult> TDigestMinAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestMinMaxCoreAsync(key, max: false, token);
         }
 
         public Task<ProbabilisticDoubleArrayResult> TDigestQuantileAsync(string key, double[] quantiles, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestQuantileCoreAsync(key, quantiles, token);
         }
 
         public Task<ProbabilisticArrayResult> TDigestRankAsync(string key, double[] values, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestRankCoreAsync(key, values, reverse: false, token);
         }
 
         public Task<ProbabilisticResultStatus> TDigestResetAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestResetCoreAsync(key, token);
         }
 
         public Task<ProbabilisticArrayResult> TDigestRevRankAsync(string key, double[] values, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestRankCoreAsync(key, values, reverse: true, token);
         }
 
         public Task<ProbabilisticDoubleResult> TDigestTrimmedMeanAsync(string key, double lowerQuantile, double upperQuantile, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return TDigestTrimmedMeanCoreAsync(key, lowerQuantile, upperQuantile, token);
         }
 
         public Task<TimeSeriesAddResult> TimeSeriesAddAsync(string key, long timestamp, double value, TimeSeriesDuplicatePolicy? onDuplicate, bool createIfMissing, CancellationToken token = default)
@@ -1278,7 +1334,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var bloomResult = await bloomCollection.DeleteManyAsync(bloomFilter, token);
             var cuckooFilter = Builders<CuckooDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var cuckooResult = await cuckooCollection.DeleteManyAsync(cuckooFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount;
+            var tdigestFilter = Builders<TDigestDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var tdigestResult = await tdigestCollection.DeleteManyAsync(tdigestFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -1482,6 +1540,23 @@ namespace Dredis.Extensions.Storage.Mongo
                 return (long)(cuckooDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
+            var tdigestDoc = await tdigestCollection.Find(TDigestKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (tdigestDoc != null)
+            {
+                if (!tdigestDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (tdigestDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await tdigestCollection.DeleteOneAsync(TDigestKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(tdigestDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
             return -2;
         }
 
@@ -1506,7 +1581,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0 ||
                 await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0 ||
                 await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0 ||
-                await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+                await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0 ||
+                await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1725,7 +1801,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0;
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
@@ -1856,7 +1937,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsSortedSetWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -1896,7 +1982,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0;
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private static bool TryParseStreamId(string id, out long milliseconds, out long sequence)
@@ -2032,7 +2123,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsHyperLogLogWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2072,7 +2168,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0;
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsBloomWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2112,7 +2213,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0;
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<bool> IsCuckooWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
@@ -2152,7 +2258,57 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
-            return await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0;
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsTDigestWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<HyperLogLogAddResult> HyperLogLogAddCoreAsync(string key, byte[][] elements, CancellationToken token)
@@ -2721,6 +2877,395 @@ namespace Dredis.Extensions.Storage.Mongo
             };
 
             return new ProbabilisticInfoResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private async Task<ProbabilisticResultStatus> TDigestCreateCoreAsync(string key, int compression, CancellationToken token)
+        {
+            if (compression <= 0)
+            {
+                return ProbabilisticResultStatus.InvalidArgument;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return ProbabilisticResultStatus.WrongType;
+            }
+
+            var existing = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (existing != null)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+
+            var created = new TDigestDocument { Key = key, Compression = compression, Values = new List<double>(), ExpireAt = null };
+            try
+            {
+                await tdigestCollection.InsertOneAsync(created, null, token);
+                return ProbabilisticResultStatus.Ok;
+            }
+            catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+            {
+                return ProbabilisticResultStatus.Exists;
+            }
+        }
+
+        private async Task<ProbabilisticResultStatus> TDigestResetCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return ProbabilisticResultStatus.WrongType;
+            }
+
+            var update = Builders<TDigestDocument>.Update.Set(x => x.Values, new List<double>());
+            var result = await tdigestCollection.UpdateOneAsync(ActiveTDigestKeyFilter(key, nowUtc), update, null, token);
+            if (result.MatchedCount == 0)
+            {
+                return ProbabilisticResultStatus.NotFound;
+            }
+
+            return ProbabilisticResultStatus.Ok;
+        }
+
+        private async Task<ProbabilisticResultStatus> TDigestAddCoreAsync(string key, double[] values, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return ProbabilisticResultStatus.WrongType;
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    return ProbabilisticResultStatus.NotFound;
+                }
+
+                if (values.Length > 0)
+                {
+                    doc.Values.AddRange(values);
+                    doc.Values.Sort();
+                    var replaced = await tdigestCollection.ReplaceOneAsync(
+                        Builders<TDigestDocument>.Filter.Eq(x => x.Id, doc.Id),
+                        doc,
+                        new ReplaceOptions(),
+                        token);
+                    if (replaced.MatchedCount == 0)
+                    {
+                        continue;
+                    }
+                }
+
+                return ProbabilisticResultStatus.Ok;
+            }
+
+            return ProbabilisticResultStatus.NotFound;
+        }
+
+        private async Task<ProbabilisticDoubleArrayResult> TDigestQuantileCoreAsync(string key, double[] quantiles, CancellationToken token)
+        {
+            for (int i = 0; i < quantiles.Length; i++)
+            {
+                if (quantiles[i] < 0 || quantiles[i] > 1)
+                {
+                    return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.InvalidArgument, Array.Empty<double>());
+                }
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<double>());
+            }
+
+            var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<double>());
+            }
+
+            var output = new double[quantiles.Length];
+            for (int i = 0; i < quantiles.Length; i++)
+            {
+                output[i] = ComputeQuantile(doc.Values, quantiles[i]);
+            }
+
+            return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.Ok, output);
+        }
+
+        private async Task<ProbabilisticDoubleArrayResult> TDigestCdfCoreAsync(string key, double[] values, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<double>());
+            }
+
+            var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<double>());
+            }
+
+            var output = new double[values.Length];
+            for (int i = 0; i < values.Length; i++)
+            {
+                output[i] = ComputeCdf(doc.Values, values[i]);
+            }
+
+            return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.Ok, output);
+        }
+
+        private async Task<ProbabilisticArrayResult> TDigestRankCoreAsync(string key, double[] values, bool reverse, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<long>());
+            }
+
+            var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<long>());
+            }
+
+            var output = new long[values.Length];
+            for (int i = 0; i < values.Length; i++)
+            {
+                output[i] = reverse
+                    ? ComputeReverseRank(doc.Values, values[i])
+                    : ComputeRank(doc.Values, values[i]);
+            }
+
+            return new ProbabilisticArrayResult(ProbabilisticResultStatus.Ok, output);
+        }
+
+        private async Task<ProbabilisticDoubleArrayResult> TDigestByRankCoreAsync(string key, long[] ranks, bool reverse, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.WrongType, Array.Empty<double>());
+            }
+
+            var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.NotFound, Array.Empty<double>());
+            }
+
+            var output = new double[ranks.Length];
+            for (int i = 0; i < ranks.Length; i++)
+            {
+                output[i] = ComputeByRank(doc.Values, ranks[i], reverse);
+            }
+
+            return new ProbabilisticDoubleArrayResult(ProbabilisticResultStatus.Ok, output);
+        }
+
+        private async Task<ProbabilisticDoubleResult> TDigestTrimmedMeanCoreAsync(string key, double lowerQuantile, double upperQuantile, CancellationToken token)
+        {
+            if (lowerQuantile < 0 || lowerQuantile > 1 || upperQuantile < 0 || upperQuantile > 1 || lowerQuantile > upperQuantile)
+            {
+                return new ProbabilisticDoubleResult(ProbabilisticResultStatus.InvalidArgument, null);
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticDoubleResult(ProbabilisticResultStatus.WrongType, null);
+            }
+
+            var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticDoubleResult(ProbabilisticResultStatus.NotFound, null);
+            }
+
+            var mean = ComputeTrimmedMean(doc.Values, lowerQuantile, upperQuantile);
+            return new ProbabilisticDoubleResult(ProbabilisticResultStatus.Ok, mean);
+        }
+
+        private async Task<ProbabilisticDoubleResult> TDigestMinMaxCoreAsync(string key, bool max, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticDoubleResult(ProbabilisticResultStatus.WrongType, null);
+            }
+
+            var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Values.Count == 0)
+            {
+                return new ProbabilisticDoubleResult(ProbabilisticResultStatus.NotFound, null);
+            }
+
+            var value = max ? doc.Values[^1] : doc.Values[0];
+            return new ProbabilisticDoubleResult(ProbabilisticResultStatus.Ok, value);
+        }
+
+        private async Task<ProbabilisticInfoResult> TDigestInfoCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsTDigestWrongTypeAsync(key, nowUtc, token))
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.WrongType, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var doc = await tdigestCollection.Find(ActiveTDigestKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new ProbabilisticInfoResult(ProbabilisticResultStatus.NotFound, Array.Empty<KeyValuePair<string, string>>());
+            }
+
+            var values = new[]
+            {
+                new KeyValuePair<string, string>("Compression", doc.Compression.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Observations", doc.Values.Count.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Min", doc.Values.Count == 0 ? "NaN" : doc.Values[0].ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>("Max", doc.Values.Count == 0 ? "NaN" : doc.Values[^1].ToString(CultureInfo.InvariantCulture))
+            };
+
+            return new ProbabilisticInfoResult(ProbabilisticResultStatus.Ok, values);
+        }
+
+        private static double ComputeQuantile(List<double> values, double quantile)
+        {
+            if (values.Count == 0)
+            {
+                return double.NaN;
+            }
+
+            if (quantile <= 0)
+            {
+                return values[0];
+            }
+
+            if (quantile >= 1)
+            {
+                return values[^1];
+            }
+
+            var position = quantile * (values.Count - 1);
+            var lower = (int)Math.Floor(position);
+            var upper = (int)Math.Ceiling(position);
+            if (lower == upper)
+            {
+                return values[lower];
+            }
+
+            var fraction = position - lower;
+            return values[lower] + ((values[upper] - values[lower]) * fraction);
+        }
+
+        private static double ComputeCdf(List<double> values, double value)
+        {
+            if (values.Count == 0)
+            {
+                return double.NaN;
+            }
+
+            var upperBound = values.BinarySearch(value);
+            if (upperBound < 0)
+            {
+                upperBound = ~upperBound;
+            }
+            else
+            {
+                while (upperBound < values.Count && values[upperBound] <= value)
+                {
+                    upperBound++;
+                }
+            }
+
+            return upperBound / (double)values.Count;
+        }
+
+        private static long ComputeRank(List<double> values, double value)
+        {
+            if (values.Count == 0)
+            {
+                return -1;
+            }
+
+            var upperBound = values.BinarySearch(value);
+            if (upperBound < 0)
+            {
+                upperBound = ~upperBound;
+            }
+            else
+            {
+                while (upperBound < values.Count && values[upperBound] <= value)
+                {
+                    upperBound++;
+                }
+            }
+
+            return upperBound - 1;
+        }
+
+        private static long ComputeReverseRank(List<double> values, double value)
+        {
+            if (values.Count == 0)
+            {
+                return -1;
+            }
+
+            var lowerBound = values.BinarySearch(value);
+            if (lowerBound < 0)
+            {
+                lowerBound = ~lowerBound;
+            }
+            else
+            {
+                while (lowerBound > 0 && values[lowerBound - 1] >= value)
+                {
+                    lowerBound--;
+                }
+            }
+
+            return values.Count - lowerBound - 1;
+        }
+
+        private static double ComputeByRank(List<double> values, long rank, bool reverse)
+        {
+            if (rank < 0 || rank >= values.Count)
+            {
+                return double.NaN;
+            }
+
+            var index = reverse ? (values.Count - 1 - (int)rank) : (int)rank;
+            return values[index];
+        }
+
+        private static double ComputeTrimmedMean(List<double> values, double lowerQuantile, double upperQuantile)
+        {
+            if (values.Count == 0)
+            {
+                return double.NaN;
+            }
+
+            var start = (int)Math.Ceiling(lowerQuantile * (values.Count - 1));
+            var end = (int)Math.Floor(upperQuantile * (values.Count - 1));
+            if (end < start)
+            {
+                return double.NaN;
+            }
+
+            var count = end - start + 1;
+            var sum = 0.0;
+            for (int i = start; i <= end; i++)
+            {
+                sum += values[i];
+            }
+
+            return sum / count;
         }
 
         private async Task<string?> StreamAddCoreAsync(string key, string id, KeyValuePair<string, byte[]>[] fields, CancellationToken token)
