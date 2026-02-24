@@ -4,6 +4,12 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Title>Dredis.Extensions.Storage.Mongo</Title>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
+    <RepositoryUrl>https://github.com/miserix13/Dredis.Extensions.Storage.Mongo</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/miserix13/Dredis.Extensions.Storage.Mongo</PackageProjectUrl>
   </PropertyGroup>
 
   <ItemGroup>
@@ -13,6 +19,17 @@
 
   <ItemGroup>
     <Compile Remove="MongoKeyValueStoreTests.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="LICENSE.txt">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Update="README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
   </ItemGroup>
 
 </Project>

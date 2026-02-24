@@ -1,4 +1,6 @@
 <Solution>
-  <Project Path="Dredis.Extensions.Storage.Mongo.csproj" />
+  <Project Path="Dredis.Extensions.Storage.Mongo.csproj">
+    <BuildType Project="Release" />
+  </Project>
   <Project Path="Dredis.Extensions.Storage.Mongo.Tests.csproj" />
 </Solution>
