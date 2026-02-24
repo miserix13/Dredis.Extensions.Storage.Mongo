@@ -15,6 +15,7 @@ namespace Dredis.Extensions.Storage.Mongo
     private readonly IMongoCollection<ListDocument> listCollection;
     private readonly IMongoCollection<SetDocument> setCollection;
     private readonly IMongoCollection<SortedSetDocument> sortedSetCollection;
+    private readonly IMongoCollection<StreamDocument> streamCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -24,6 +25,7 @@ namespace Dredis.Extensions.Storage.Mongo
             this.listCollection = this.database.GetCollection<ListDocument>($"{collectionName ?? "kvstore"}_list");
             this.setCollection = this.database.GetCollection<SetDocument>($"{collectionName ?? "kvstore"}_set");
             this.sortedSetCollection = this.database.GetCollection<SortedSetDocument>($"{collectionName ?? "kvstore"}_zset");
+            this.streamCollection = this.database.GetCollection<StreamDocument>($"{collectionName ?? "kvstore"}_stream");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -45,6 +47,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var sortedSetKeyIndexModel = new CreateIndexModel<SortedSetDocument>(sortedSetKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.sortedSetCollection.Indexes.CreateOne(sortedSetKeyIndexModel);
 
+            var streamKeyIndexKeys = Builders<StreamDocument>.IndexKeys.Ascending(x => x.Key);
+            var streamKeyIndexModel = new CreateIndexModel<StreamDocument>(streamKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.streamCollection.Indexes.CreateOne(streamKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -65,6 +71,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var sortedSetTtlIndexKeys = Builders<SortedSetDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var sortedSetTtlIndexModel = new CreateIndexModel<SortedSetDocument>(sortedSetTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.sortedSetCollection.Indexes.CreateOne(sortedSetTtlIndexModel);
+
+            var streamTtlIndexKeys = Builders<StreamDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var streamTtlIndexModel = new CreateIndexModel<StreamDocument>(streamTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.streamCollection.Indexes.CreateOne(streamTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -124,6 +134,52 @@ namespace Dredis.Extensions.Storage.Mongo
             public string Key { get; set; } = null!;
             public List<SortedSetMemberDocument> Members { get; set; } = new();
             public DateTime? ExpireAt { get; set; }
+        }
+
+        private class StreamFieldDocument
+        {
+            public string Field { get; set; } = null!;
+            public byte[] Value { get; set; } = null!;
+        }
+
+        private class StreamEntryDocument
+        {
+            public string Id { get; set; } = null!;
+            public long Milliseconds { get; set; }
+            public long Sequence { get; set; }
+            public List<StreamFieldDocument> Fields { get; set; } = new();
+        }
+
+        private class StreamDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public List<StreamEntryDocument> Entries { get; set; } = new();
+            public string? LastId { get; set; }
+            public List<StreamGroupDocument> Groups { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
+        private class StreamGroupDocument
+        {
+            public string Name { get; set; } = null!;
+            public string LastDeliveredId { get; set; } = "0-0";
+            public List<StreamConsumerDocument> Consumers { get; set; } = new();
+            public List<StreamPendingDocument> Pending { get; set; } = new();
+        }
+
+        private class StreamConsumerDocument
+        {
+            public string Name { get; set; } = null!;
+            public long LastSeenUnixMs { get; set; }
+        }
+
+        private class StreamPendingDocument
+        {
+            public string Id { get; set; } = null!;
+            public string Consumer { get; set; } = null!;
+            public long LastDeliveryUnixMs { get; set; }
+            public long DeliveryCount { get; set; }
         }
 
         private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
@@ -195,6 +251,21 @@ namespace Dredis.Extensions.Storage.Mongo
             Builders<SortedSetDocument>.Filter.And(
                 Builders<SortedSetDocument>.Filter.In(x => x.Key, keys),
                 ActiveSortedSetFilter(nowUtc));
+
+        private FilterDefinition<StreamDocument> StreamKeyFilter(string key) => Builders<StreamDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<StreamDocument> ActiveStreamFilter(DateTime nowUtc) =>
+            Builders<StreamDocument>.Filter.Or(
+                Builders<StreamDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<StreamDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<StreamDocument> ActiveStreamKeyFilter(string key, DateTime nowUtc) =>
+            Builders<StreamDocument>.Filter.And(StreamKeyFilter(key), ActiveStreamFilter(nowUtc));
+
+        private FilterDefinition<StreamDocument> ActiveStreamKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<StreamDocument>.Filter.And(
+                Builders<StreamDocument>.Filter.In(x => x.Key, keys),
+                ActiveStreamFilter(nowUtc));
 
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
@@ -269,7 +340,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var setResult = await setCollection.DeleteManyAsync(setFilter, token);
             var sortedSetFilter = Builders<SortedSetDocument>.Filter.In(x => x.Key, keys);
             var sortedSetResult = await sortedSetCollection.DeleteManyAsync(sortedSetFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount;
+            var streamFilter = Builders<StreamDocument>.Filter.In(x => x.Key, keys);
+            var streamResult = await streamCollection.DeleteManyAsync(streamFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -300,7 +373,13 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var sortedSetCount = await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token);
-            return sortedSetCount > 0;
+            if (sortedSetCount > 0)
+            {
+                return true;
+            }
+
+            var streamCount = await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token);
+            return streamCount > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -343,6 +422,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var streamKeys = await streamCollection.Find(ActiveStreamKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in streamKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -357,6 +442,7 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await listCollection.DeleteOneAsync(ActiveListKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await setCollection.DeleteOneAsync(ActiveSetKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await sortedSetCollection.DeleteOneAsync(ActiveSortedSetKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await streamCollection.DeleteOneAsync(ActiveStreamKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -397,7 +483,15 @@ namespace Dredis.Extensions.Storage.Mongo
             var sortedSetFilter = ActiveSortedSetKeyFilter(key, nowUtc);
             var sortedSetUpdate = Builders<SortedSetDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var sortedSetResult = await sortedSetCollection.UpdateOneAsync(sortedSetFilter, sortedSetUpdate, null, token);
-            return sortedSetResult.MatchedCount > 0;
+            if (sortedSetResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var streamFilter = ActiveStreamKeyFilter(key, nowUtc);
+            var streamUpdate = Builders<StreamDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var streamResult = await streamCollection.UpdateOneAsync(streamFilter, streamUpdate, null, token);
+            return streamResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -702,102 +796,102 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<StreamAckResult> StreamAckAsync(string key, string group, string[] ids, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamAckCoreAsync(key, group, ids, token);
         }
 
         public Task<string?> StreamAddAsync(string key, string id, KeyValuePair<string, byte[]>[] fields, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamAddCoreAsync(key, id, fields, token);
         }
 
         public Task<StreamClaimResult> StreamClaimAsync(string key, string group, string consumer, long minIdleTimeMs, string[] ids, long? idleMs = null, long? timeMs = null, long? retryCount = null, bool force = false, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamClaimCoreAsync(key, group, consumer, minIdleTimeMs, ids, idleMs, timeMs, retryCount, force, token);
         }
 
         public Task<StreamConsumersInfoResult> StreamConsumersInfoAsync(string key, string group, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamConsumersInfoCoreAsync(key, group, token);
         }
 
         public Task<long> StreamDeleteAsync(string key, string[] ids, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamDeleteCoreAsync(key, ids, token);
         }
 
         public Task<StreamGroupCreateResult> StreamGroupCreateAsync(string key, string group, string startId, bool mkStream, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamGroupCreateCoreAsync(key, group, startId, mkStream, token);
         }
 
         public Task<StreamGroupDelConsumerResult> StreamGroupDelConsumerAsync(string key, string group, string consumer, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamGroupDelConsumerCoreAsync(key, group, consumer, token);
         }
 
         public Task<StreamGroupDestroyResult> StreamGroupDestroyAsync(string key, string group, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamGroupDestroyCoreAsync(key, group, token);
         }
 
         public Task<StreamGroupReadResult> StreamGroupReadAsync(string group, string consumer, string[] keys, string[] ids, int? count, TimeSpan? block, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamGroupReadCoreAsync(group, consumer, keys, ids, count, block, token);
         }
 
         public Task<StreamGroupSetIdResultStatus> StreamGroupSetIdAsync(string key, string group, string lastId, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamGroupSetIdCoreAsync(key, group, lastId, token);
         }
 
         public Task<StreamGroupsInfoResult> StreamGroupsInfoAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamGroupsInfoCoreAsync(key, token);
         }
 
         public Task<StreamInfoResult> StreamInfoAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamInfoCoreAsync(key, token);
         }
 
         public Task<string?> StreamLastIdAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamLastIdCoreAsync(key, token);
         }
 
         public Task<long> StreamLengthAsync(string key, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamLengthCoreAsync(key, token);
         }
 
         public Task<StreamPendingResult> StreamPendingAsync(string key, string group, long? minIdleTimeMs = null, string? start = null, string? end = null, int? count = null, string? consumer = null, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamPendingCoreAsync(key, group, minIdleTimeMs, start, end, count, consumer, token);
         }
 
         public Task<StreamEntry[]> StreamRangeAsync(string key, string start, string end, int? count, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamRangeCoreAsync(key, start, end, count, reverse: false, token);
         }
 
         public Task<StreamEntry[]> StreamRangeReverseAsync(string key, string start, string end, int? count, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamRangeCoreAsync(key, start, end, count, reverse: true, token);
         }
 
         public Task<StreamReadResult[]> StreamReadAsync(string[] keys, string[] ids, int? count, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamReadCoreAsync(keys, ids, count, token);
         }
 
         public Task<StreamSetIdResultStatus> StreamSetIdAsync(string key, string lastId, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamSetIdCoreAsync(key, lastId, token);
         }
 
         public Task<long> StreamTrimAsync(string key, int? maxLength = null, string? minId = null, bool approximate = false, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return StreamTrimCoreAsync(key, maxLength, minId, approximate, token);
         }
 
         public Task<ProbabilisticResultStatus> TDigestAddAsync(string key, double[] values, CancellationToken token = default)
@@ -988,7 +1082,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var setResult = await setCollection.DeleteManyAsync(setFilter, token);
             var sortedSetFilter = Builders<SortedSetDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var sortedSetResult = await sortedSetCollection.DeleteManyAsync(sortedSetFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount;
+            var streamFilter = Builders<StreamDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var streamResult = await streamCollection.DeleteManyAsync(streamFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -1124,6 +1220,23 @@ namespace Dredis.Extensions.Storage.Mongo
                 return (long)(sortedSetDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
+            var streamDoc = await streamCollection.Find(StreamKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (streamDoc != null)
+            {
+                if (!streamDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (streamDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await streamCollection.DeleteOneAsync(StreamKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(streamDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
             return -2;
         }
 
@@ -1142,7 +1255,10 @@ namespace Dredis.Extensions.Storage.Mongo
         {
             var nowUtc = DateTime.UtcNow;
             if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0 ||
-                await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+                await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0 ||
+                await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0 ||
+                await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0 ||
+                await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1339,7 +1455,13 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var sortedSetCount = await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token);
-            return sortedSetCount > 0;
+            if (sortedSetCount > 0)
+            {
+                return true;
+            }
+
+            var streamCount = await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token);
+            return streamCount > 0;
         }
 
         private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
@@ -1369,6 +1491,11 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
             return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
         }
 
@@ -1389,7 +1516,1083 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
             return await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private static bool TryParseStreamId(string id, out long milliseconds, out long sequence)
+        {
+            milliseconds = 0;
+            sequence = 0;
+            var sepIndex = id.IndexOf('-');
+            if (sepIndex <= 0 || sepIndex >= id.Length - 1)
+            {
+                return false;
+            }
+
+            var msPart = id.Substring(0, sepIndex);
+            var seqPart = id.Substring(sepIndex + 1);
+            if (!long.TryParse(msPart, NumberStyles.Integer, CultureInfo.InvariantCulture, out milliseconds) || milliseconds < 0)
+            {
+                return false;
+            }
+
+            if (!long.TryParse(seqPart, NumberStyles.Integer, CultureInfo.InvariantCulture, out sequence) || sequence < 0)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static int CompareStreamIds(long leftMs, long leftSeq, long rightMs, long rightSeq)
+        {
+            var msCompare = leftMs.CompareTo(rightMs);
+            if (msCompare != 0)
+            {
+                return msCompare;
+            }
+
+            return leftSeq.CompareTo(rightSeq);
+        }
+
+        private static StreamEntry ToStreamEntry(StreamEntryDocument entry)
+        {
+            var fields = entry.Fields
+                .Select(x => new KeyValuePair<string, byte[]>(x.Field, x.Value))
+                .ToArray();
+            return new StreamEntry(entry.Id, fields);
+        }
+
+        private static int CompareStreamIds(string left, string right)
+        {
+            if (TryParseStreamId(left, out var leftMs, out var leftSeq) && TryParseStreamId(right, out var rightMs, out var rightSeq))
+            {
+                return CompareStreamIds(leftMs, leftSeq, rightMs, rightSeq);
+            }
+
+            return string.CompareOrdinal(left, right);
+        }
+
+        private static string ResolveGroupStartId(StreamDocument? doc, string startId)
+        {
+            if (startId == "$")
+            {
+                return doc?.LastId ?? "0-0";
+            }
+
+            if (startId == "-")
+            {
+                return "0-0";
+            }
+
+            return startId;
+        }
+
+        private static bool IsValidGroupStartId(StreamDocument? doc, string startId)
+        {
+            var resolved = ResolveGroupStartId(doc, startId);
+            return TryParseStreamId(resolved, out _, out _);
+        }
+
+        private static void EnsureConsumer(StreamGroupDocument group, string consumer, long nowUnixMs)
+        {
+            var existing = group.Consumers.FirstOrDefault(x => string.Equals(x.Name, consumer, StringComparison.Ordinal));
+            if (existing == null)
+            {
+                group.Consumers.Add(new StreamConsumerDocument { Name = consumer, LastSeenUnixMs = nowUnixMs });
+                return;
+            }
+
+            existing.LastSeenUnixMs = nowUnixMs;
+        }
+
+        private static void RemovePendingForMissingEntries(StreamDocument doc)
+        {
+            var validIds = new HashSet<string>(doc.Entries.Select(x => x.Id), StringComparer.Ordinal);
+            for (int i = 0; i < doc.Groups.Count; i++)
+            {
+                doc.Groups[i].Pending.RemoveAll(x => !validIds.Contains(x.Id));
+            }
+        }
+
+        private async Task<bool> IsStreamWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<string?> StreamAddCoreAsync(string key, string id, KeyValuePair<string, byte[]>[] fields, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return null;
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+
+                long lastMs = -1;
+                long lastSeq = -1;
+                if (doc != null && !string.IsNullOrEmpty(doc.LastId) && TryParseStreamId(doc.LastId!, out var parsedLastMs, out var parsedLastSeq))
+                {
+                    lastMs = parsedLastMs;
+                    lastSeq = parsedLastSeq;
+                }
+
+                long newMs;
+                long newSeq;
+
+                if (id == "*")
+                {
+                    newMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    if (newMs < lastMs)
+                    {
+                        newMs = lastMs;
+                    }
+
+                    newSeq = newMs == lastMs ? lastSeq + 1 : 0;
+                }
+                else if (id.EndsWith("-*", StringComparison.Ordinal))
+                {
+                    var msText = id.Substring(0, id.Length - 2);
+                    if (!long.TryParse(msText, NumberStyles.Integer, CultureInfo.InvariantCulture, out newMs) || newMs < 0)
+                    {
+                        return null;
+                    }
+
+                    if (newMs < lastMs)
+                    {
+                        return null;
+                    }
+
+                    newSeq = newMs == lastMs ? lastSeq + 1 : 0;
+                }
+                else
+                {
+                    if (!TryParseStreamId(id, out newMs, out newSeq))
+                    {
+                        return null;
+                    }
+
+                    if (CompareStreamIds(newMs, newSeq, lastMs, lastSeq) <= 0)
+                    {
+                        return null;
+                    }
+                }
+
+                var newId = $"{newMs.ToString(CultureInfo.InvariantCulture)}-{newSeq.ToString(CultureInfo.InvariantCulture)}";
+                var newEntry = new StreamEntryDocument
+                {
+                    Id = newId,
+                    Milliseconds = newMs,
+                    Sequence = newSeq,
+                    Fields = fields.Select(x => new StreamFieldDocument { Field = x.Key, Value = x.Value }).ToList()
+                };
+
+                if (doc == null)
+                {
+                    try
+                    {
+                        var created = new StreamDocument
+                        {
+                            Key = key,
+                            LastId = newId,
+                            ExpireAt = null,
+                            Entries = new List<StreamEntryDocument> { newEntry }
+                        };
+
+                        await streamCollection.InsertOneAsync(created, null, token);
+                        return newId;
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                doc.Entries.Add(newEntry);
+                doc.LastId = newId;
+                doc.Entries = doc.Entries
+                    .OrderBy(x => x.Milliseconds)
+                    .ThenBy(x => x.Sequence)
+                    .ToList();
+
+                var replace = await streamCollection.ReplaceOneAsync(
+                    Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+                if (replace.MatchedCount > 0)
+                {
+                    return newId;
+                }
+            }
+
+            return null;
+        }
+
+        private async Task<long> StreamDeleteCoreAsync(string key, string[] ids, CancellationToken token)
+        {
+            if (ids.Length == 0)
+            {
+                return 0;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return 0;
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Entries.Count == 0)
+            {
+                return 0;
+            }
+
+            var idSet = new HashSet<string>(ids, StringComparer.Ordinal);
+            var original = doc.Entries.Count;
+            doc.Entries.RemoveAll(x => idSet.Contains(x.Id));
+            var removed = original - doc.Entries.Count;
+            if (removed <= 0)
+            {
+                return 0;
+            }
+
+            if (doc.Entries.Count == 0)
+            {
+                await streamCollection.DeleteOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), token);
+            }
+            else
+            {
+                var last = doc.Entries[^1];
+                doc.LastId = last.Id;
+                RemovePendingForMissingEntries(doc);
+                await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            }
+
+            return removed;
+        }
+
+        private async Task<long> StreamLengthCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return 0;
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            return doc?.Entries.Count ?? 0;
+        }
+
+        private async Task<string?> StreamLastIdCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return null;
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            return doc?.LastId;
+        }
+
+        private async Task<StreamEntry[]> StreamRangeCoreAsync(string key, string start, string end, int? count, bool reverse, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return Array.Empty<StreamEntry>();
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Entries.Count == 0)
+            {
+                return Array.Empty<StreamEntry>();
+            }
+
+            long startMs;
+            long startSeq;
+            if (start == "-")
+            {
+                startMs = long.MinValue;
+                startSeq = long.MinValue;
+            }
+            else if (start == "+")
+            {
+                startMs = long.MaxValue;
+                startSeq = long.MaxValue;
+            }
+            else if (!TryParseStreamId(start, out startMs, out startSeq))
+            {
+                return Array.Empty<StreamEntry>();
+            }
+
+            long endMs;
+            long endSeq;
+            if (end == "+")
+            {
+                endMs = long.MaxValue;
+                endSeq = long.MaxValue;
+            }
+            else if (end == "-")
+            {
+                endMs = long.MinValue;
+                endSeq = long.MinValue;
+            }
+            else if (!TryParseStreamId(end, out endMs, out endSeq))
+            {
+                return Array.Empty<StreamEntry>();
+            }
+
+            IEnumerable<StreamEntryDocument> query = doc.Entries.Where(x =>
+                CompareStreamIds(x.Milliseconds, x.Sequence, startMs, startSeq) >= 0 &&
+                CompareStreamIds(x.Milliseconds, x.Sequence, endMs, endSeq) <= 0);
+
+            query = reverse
+                ? query.OrderByDescending(x => x.Milliseconds).ThenByDescending(x => x.Sequence)
+                : query.OrderBy(x => x.Milliseconds).ThenBy(x => x.Sequence);
+
+            if (count.HasValue && count.Value > 0)
+            {
+                query = query.Take(count.Value);
+            }
+
+            return query.Select(ToStreamEntry).ToArray();
+        }
+
+        private async Task<StreamReadResult[]> StreamReadCoreAsync(string[] keys, string[] ids, int? count, CancellationToken token)
+        {
+            if (keys.Length == 0 || ids.Length == 0 || keys.Length != ids.Length)
+            {
+                return Array.Empty<StreamReadResult>();
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            var results = new List<StreamReadResult>(keys.Length);
+            for (int i = 0; i < keys.Length; i++)
+            {
+                var key = keys[i];
+                if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+                {
+                    continue;
+                }
+
+                var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null || doc.Entries.Count == 0)
+                {
+                    continue;
+                }
+
+                if (!TryParseStreamId(ids[i], out var fromMs, out var fromSeq))
+                {
+                    continue;
+                }
+
+                IEnumerable<StreamEntryDocument> query = doc.Entries
+                    .Where(x => CompareStreamIds(x.Milliseconds, x.Sequence, fromMs, fromSeq) > 0)
+                    .OrderBy(x => x.Milliseconds)
+                    .ThenBy(x => x.Sequence);
+
+                if (count.HasValue && count.Value > 0)
+                {
+                    query = query.Take(count.Value);
+                }
+
+                var entries = query.Select(ToStreamEntry).ToArray();
+                if (entries.Length > 0)
+                {
+                    results.Add(new StreamReadResult(key, entries));
+                }
+            }
+
+            return results.ToArray();
+        }
+
+        private async Task<StreamSetIdResultStatus> StreamSetIdCoreAsync(string key, string lastId, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return StreamSetIdResultStatus.WrongType;
+            }
+
+            if (!TryParseStreamId(lastId, out var newMs, out var newSeq))
+            {
+                return StreamSetIdResultStatus.InvalidId;
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                try
+                {
+                    var created = new StreamDocument { Key = key, LastId = lastId, ExpireAt = null };
+                    await streamCollection.InsertOneAsync(created, null, token);
+                    return StreamSetIdResultStatus.Ok;
+                }
+                catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                {
+                    return StreamSetIdResultStatus.Ok;
+                }
+            }
+
+            if (doc.Entries.Count > 0)
+            {
+                var maxEntry = doc.Entries
+                    .OrderByDescending(x => x.Milliseconds)
+                    .ThenByDescending(x => x.Sequence)
+                    .First();
+                if (CompareStreamIds(newMs, newSeq, maxEntry.Milliseconds, maxEntry.Sequence) < 0)
+                {
+                    return StreamSetIdResultStatus.InvalidId;
+                }
+            }
+
+            doc.LastId = lastId;
+            await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            return StreamSetIdResultStatus.Ok;
+        }
+
+        private async Task<long> StreamTrimCoreAsync(string key, int? maxLength, string? minId, bool approximate, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return 0;
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null || doc.Entries.Count == 0)
+            {
+                return 0;
+            }
+
+            var original = doc.Entries.Count;
+
+            if (maxLength.HasValue && maxLength.Value >= 0 && doc.Entries.Count > maxLength.Value)
+            {
+                var toRemove = doc.Entries.Count - maxLength.Value;
+                doc.Entries.RemoveRange(0, toRemove);
+            }
+
+            if (!string.IsNullOrEmpty(minId) && TryParseStreamId(minId!, out var minMs, out var minSeq))
+            {
+                doc.Entries = doc.Entries
+                    .Where(x => CompareStreamIds(x.Milliseconds, x.Sequence, minMs, minSeq) >= 0)
+                    .ToList();
+            }
+
+            var removed = original - doc.Entries.Count;
+            if (removed <= 0)
+            {
+                return 0;
+            }
+
+            if (doc.Entries.Count == 0)
+            {
+                await streamCollection.DeleteOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), token);
+                return removed;
+            }
+
+            var last = doc.Entries[^1];
+            doc.LastId = last.Id;
+            RemovePendingForMissingEntries(doc);
+            await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            return removed;
+        }
+
+        private async Task<StreamInfoResult> StreamInfoCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return new StreamInfoResult(StreamInfoResultStatus.WrongType, null);
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new StreamInfoResult(StreamInfoResultStatus.NoStream, null);
+            }
+
+            StreamEntry? firstEntry = null;
+            StreamEntry? lastEntry = null;
+            if (doc.Entries.Count > 0)
+            {
+                var ordered = doc.Entries
+                    .OrderBy(x => x.Milliseconds)
+                    .ThenBy(x => x.Sequence)
+                    .ToList();
+                firstEntry = ToStreamEntry(ordered[0]);
+                lastEntry = ToStreamEntry(ordered[^1]);
+            }
+
+            var info = new StreamInfo(doc.Entries.Count, doc.LastId, firstEntry, lastEntry);
+            return new StreamInfoResult(StreamInfoResultStatus.Ok, info);
+        }
+
+        private async Task<StreamGroupCreateResult> StreamGroupCreateCoreAsync(string key, string group, string startId, bool mkStream, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return StreamGroupCreateResult.WrongType;
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (!IsValidGroupStartId(doc, startId))
+                {
+                    return StreamGroupCreateResult.InvalidId;
+                }
+
+                if (doc == null)
+                {
+                    if (!mkStream)
+                    {
+                        return StreamGroupCreateResult.NoStream;
+                    }
+
+                    var created = new StreamDocument
+                    {
+                        Key = key,
+                        Entries = new List<StreamEntryDocument>(),
+                        LastId = null,
+                        ExpireAt = null,
+                        Groups = new List<StreamGroupDocument>
+                        {
+                            new StreamGroupDocument
+                            {
+                                Name = group,
+                                LastDeliveredId = ResolveGroupStartId(null, startId),
+                                Consumers = new List<StreamConsumerDocument>(),
+                                Pending = new List<StreamPendingDocument>()
+                            }
+                        }
+                    };
+
+                    try
+                    {
+                        await streamCollection.InsertOneAsync(created, null, token);
+                        return StreamGroupCreateResult.Ok;
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                if (doc.Groups.Any(x => string.Equals(x.Name, group, StringComparison.Ordinal)))
+                {
+                    return StreamGroupCreateResult.Exists;
+                }
+
+                doc.Groups.Add(new StreamGroupDocument
+                {
+                    Name = group,
+                    LastDeliveredId = ResolveGroupStartId(doc, startId),
+                    Consumers = new List<StreamConsumerDocument>(),
+                    Pending = new List<StreamPendingDocument>()
+                });
+
+                var replace = await streamCollection.ReplaceOneAsync(
+                    Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+                if (replace.MatchedCount > 0)
+                {
+                    return StreamGroupCreateResult.Ok;
+                }
+            }
+
+            return StreamGroupCreateResult.Exists;
+        }
+
+        private async Task<StreamGroupDestroyResult> StreamGroupDestroyCoreAsync(string key, string group, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return StreamGroupDestroyResult.WrongType;
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return StreamGroupDestroyResult.NotFound;
+            }
+
+            var removed = doc.Groups.RemoveAll(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+            if (removed <= 0)
+            {
+                return StreamGroupDestroyResult.NotFound;
+            }
+
+            await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            return StreamGroupDestroyResult.Removed;
+        }
+
+        private async Task<StreamGroupSetIdResultStatus> StreamGroupSetIdCoreAsync(string key, string group, string lastId, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return StreamGroupSetIdResultStatus.WrongType;
+            }
+
+            if (!TryParseStreamId(lastId, out _, out _))
+            {
+                return StreamGroupSetIdResultStatus.InvalidId;
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return StreamGroupSetIdResultStatus.NoStream;
+            }
+
+            var groupDoc = doc.Groups.FirstOrDefault(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+            if (groupDoc == null)
+            {
+                return StreamGroupSetIdResultStatus.NoGroup;
+            }
+
+            groupDoc.LastDeliveredId = lastId;
+            await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            return StreamGroupSetIdResultStatus.Ok;
+        }
+
+        private async Task<StreamGroupDelConsumerResult> StreamGroupDelConsumerCoreAsync(string key, string group, string consumer, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return new StreamGroupDelConsumerResult(StreamGroupDelConsumerResultStatus.WrongType, 0);
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new StreamGroupDelConsumerResult(StreamGroupDelConsumerResultStatus.NoStream, 0);
+            }
+
+            var groupDoc = doc.Groups.FirstOrDefault(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+            if (groupDoc == null)
+            {
+                return new StreamGroupDelConsumerResult(StreamGroupDelConsumerResultStatus.NoGroup, 0);
+            }
+
+            var removed = groupDoc.Pending.RemoveAll(x => string.Equals(x.Consumer, consumer, StringComparison.Ordinal));
+            groupDoc.Consumers.RemoveAll(x => string.Equals(x.Name, consumer, StringComparison.Ordinal));
+
+            await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            return new StreamGroupDelConsumerResult(StreamGroupDelConsumerResultStatus.Ok, removed);
+        }
+
+        private async Task<StreamGroupsInfoResult> StreamGroupsInfoCoreAsync(string key, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return new StreamGroupsInfoResult(StreamInfoResultStatus.WrongType, Array.Empty<StreamGroupInfo>());
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new StreamGroupsInfoResult(StreamInfoResultStatus.NoStream, Array.Empty<StreamGroupInfo>());
+            }
+
+            var groups = doc.Groups
+                .Select(x => new StreamGroupInfo(x.Name, x.Consumers.Count, x.Pending.Count, x.LastDeliveredId))
+                .ToArray();
+            return new StreamGroupsInfoResult(StreamInfoResultStatus.Ok, groups);
+        }
+
+        private async Task<StreamConsumersInfoResult> StreamConsumersInfoCoreAsync(string key, string group, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return new StreamConsumersInfoResult(StreamInfoResultStatus.WrongType, Array.Empty<StreamConsumerInfo>());
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new StreamConsumersInfoResult(StreamInfoResultStatus.NoStream, Array.Empty<StreamConsumerInfo>());
+            }
+
+            var groupDoc = doc.Groups.FirstOrDefault(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+            if (groupDoc == null)
+            {
+                return new StreamConsumersInfoResult(StreamInfoResultStatus.NoGroup, Array.Empty<StreamConsumerInfo>());
+            }
+
+            var nowUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var consumers = groupDoc.Consumers
+                .Select(x =>
+                {
+                    var pendingCount = groupDoc.Pending.LongCount(p => string.Equals(p.Consumer, x.Name, StringComparison.Ordinal));
+                    var idleMs = Math.Max(0, nowUnixMs - x.LastSeenUnixMs);
+                    return new StreamConsumerInfo(x.Name, pendingCount, idleMs);
+                })
+                .ToArray();
+
+            return new StreamConsumersInfoResult(StreamInfoResultStatus.Ok, consumers);
+        }
+
+        private async Task<StreamGroupReadResult> StreamGroupReadCoreAsync(string group, string consumer, string[] keys, string[] ids, int? count, TimeSpan? block, CancellationToken token)
+        {
+            if (keys.Length == 0 || keys.Length != ids.Length)
+            {
+                return new StreamGroupReadResult(StreamGroupReadResultStatus.InvalidId, Array.Empty<StreamReadResult>());
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            var nowUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var results = new List<StreamReadResult>(keys.Length);
+
+            for (int i = 0; i < keys.Length; i++)
+            {
+                var key = keys[i];
+                if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+                {
+                    return new StreamGroupReadResult(StreamGroupReadResultStatus.WrongType, Array.Empty<StreamReadResult>());
+                }
+
+                var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    return new StreamGroupReadResult(StreamGroupReadResultStatus.NoStream, Array.Empty<StreamReadResult>());
+                }
+
+                var groupDoc = doc.Groups.FirstOrDefault(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+                if (groupDoc == null)
+                {
+                    return new StreamGroupReadResult(StreamGroupReadResultStatus.NoGroup, Array.Empty<StreamReadResult>());
+                }
+
+                var id = ids[i];
+                string fromId;
+                if (id == ">")
+                {
+                    fromId = groupDoc.LastDeliveredId;
+                }
+                else
+                {
+                    if (!TryParseStreamId(id, out _, out _))
+                    {
+                        return new StreamGroupReadResult(StreamGroupReadResultStatus.InvalidId, Array.Empty<StreamReadResult>());
+                    }
+
+                    fromId = id;
+                }
+
+                if (!TryParseStreamId(fromId, out var fromMs, out var fromSeq))
+                {
+                    return new StreamGroupReadResult(StreamGroupReadResultStatus.InvalidId, Array.Empty<StreamReadResult>());
+                }
+
+                IEnumerable<StreamEntryDocument> query = doc.Entries
+                    .Where(x => CompareStreamIds(x.Milliseconds, x.Sequence, fromMs, fromSeq) > 0)
+                    .OrderBy(x => x.Milliseconds)
+                    .ThenBy(x => x.Sequence);
+
+                if (count.HasValue && count.Value > 0)
+                {
+                    query = query.Take(count.Value);
+                }
+
+                var selected = query.ToList();
+                EnsureConsumer(groupDoc, consumer, nowUnixMs);
+
+                if (selected.Count > 0)
+                {
+                    for (int entryIndex = 0; entryIndex < selected.Count; entryIndex++)
+                    {
+                        var entry = selected[entryIndex];
+                        var pending = groupDoc.Pending.FirstOrDefault(x => string.Equals(x.Id, entry.Id, StringComparison.Ordinal));
+                        if (pending == null)
+                        {
+                            pending = new StreamPendingDocument
+                            {
+                                Id = entry.Id,
+                                Consumer = consumer,
+                                LastDeliveryUnixMs = nowUnixMs,
+                                DeliveryCount = 1
+                            };
+                            groupDoc.Pending.Add(pending);
+                        }
+                        else
+                        {
+                            pending.Consumer = consumer;
+                            pending.LastDeliveryUnixMs = nowUnixMs;
+                            pending.DeliveryCount++;
+                        }
+
+                        groupDoc.LastDeliveredId = entry.Id;
+                    }
+
+                    results.Add(new StreamReadResult(key, selected.Select(ToStreamEntry).ToArray()));
+                }
+
+                await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            }
+
+            return new StreamGroupReadResult(StreamGroupReadResultStatus.Ok, results.ToArray());
+        }
+
+        private async Task<StreamAckResult> StreamAckCoreAsync(string key, string group, string[] ids, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return new StreamAckResult(StreamAckResultStatus.WrongType, 0);
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new StreamAckResult(StreamAckResultStatus.NoStream, 0);
+            }
+
+            var groupDoc = doc.Groups.FirstOrDefault(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+            if (groupDoc == null)
+            {
+                return new StreamAckResult(StreamAckResultStatus.NoGroup, 0);
+            }
+
+            if (ids.Length == 0)
+            {
+                return new StreamAckResult(StreamAckResultStatus.Ok, 0);
+            }
+
+            var idSet = new HashSet<string>(ids, StringComparer.Ordinal);
+            var removed = groupDoc.Pending.RemoveAll(x => idSet.Contains(x.Id));
+            if (removed > 0)
+            {
+                await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            }
+
+            return new StreamAckResult(StreamAckResultStatus.Ok, removed);
+        }
+
+        private async Task<StreamPendingResult> StreamPendingCoreAsync(string key, string group, long? minIdleTimeMs, string? start, string? end, int? count, string? consumer, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return new StreamPendingResult(StreamPendingResultStatus.WrongType, 0, null, null, Array.Empty<StreamPendingConsumerInfo>(), Array.Empty<StreamPendingEntry>());
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new StreamPendingResult(StreamPendingResultStatus.NoStream, 0, null, null, Array.Empty<StreamPendingConsumerInfo>(), Array.Empty<StreamPendingEntry>());
+            }
+
+            var groupDoc = doc.Groups.FirstOrDefault(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+            if (groupDoc == null)
+            {
+                return new StreamPendingResult(StreamPendingResultStatus.NoGroup, 0, null, null, Array.Empty<StreamPendingConsumerInfo>(), Array.Empty<StreamPendingEntry>());
+            }
+
+            RemovePendingForMissingEntries(doc);
+
+            var orderedAll = groupDoc.Pending
+                .OrderBy(x => x.Id, Comparer<string>.Create(CompareStreamIds))
+                .ToList();
+
+            var totalCount = orderedAll.Count;
+            var smallest = totalCount > 0 ? orderedAll[0].Id : null;
+            var largest = totalCount > 0 ? orderedAll[^1].Id : null;
+
+            var summaryOnly = minIdleTimeMs == null && start == null && end == null && count == null && consumer == null;
+            if (summaryOnly)
+            {
+                var consumers = orderedAll
+                    .GroupBy(x => x.Consumer, StringComparer.Ordinal)
+                    .Select(x => new StreamPendingConsumerInfo(x.Key, x.LongCount()))
+                    .ToArray();
+
+                return new StreamPendingResult(StreamPendingResultStatus.Ok, totalCount, smallest, largest, consumers, Array.Empty<StreamPendingEntry>());
+            }
+
+            IEnumerable<StreamPendingDocument> filtered = orderedAll;
+            var nowUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            if (minIdleTimeMs.HasValue && minIdleTimeMs.Value > 0)
+            {
+                filtered = filtered.Where(x => nowUnixMs - x.LastDeliveryUnixMs >= minIdleTimeMs.Value);
+            }
+
+            if (!string.IsNullOrEmpty(consumer))
+            {
+                filtered = filtered.Where(x => string.Equals(x.Consumer, consumer, StringComparison.Ordinal));
+            }
+
+            var startBound = start ?? "-";
+            var endBound = end ?? "+";
+
+            if (startBound != "-" && !TryParseStreamId(startBound, out _, out _))
+            {
+                return new StreamPendingResult(StreamPendingResultStatus.Ok, totalCount, smallest, largest, Array.Empty<StreamPendingConsumerInfo>(), Array.Empty<StreamPendingEntry>());
+            }
+
+            if (endBound != "+" && !TryParseStreamId(endBound, out _, out _))
+            {
+                return new StreamPendingResult(StreamPendingResultStatus.Ok, totalCount, smallest, largest, Array.Empty<StreamPendingConsumerInfo>(), Array.Empty<StreamPendingEntry>());
+            }
+
+            filtered = filtered.Where(x =>
+                (startBound == "-" || CompareStreamIds(x.Id, startBound) >= 0) &&
+                (endBound == "+" || CompareStreamIds(x.Id, endBound) <= 0));
+
+            if (count.HasValue)
+            {
+                if (count.Value <= 0)
+                {
+                    filtered = Array.Empty<StreamPendingDocument>();
+                }
+                else
+                {
+                    filtered = filtered.Take(count.Value);
+                }
+            }
+
+            var entries = filtered
+                .Select(x => new StreamPendingEntry(x.Id, x.Consumer, Math.Max(0, nowUnixMs - x.LastDeliveryUnixMs), x.DeliveryCount))
+                .ToArray();
+
+            return new StreamPendingResult(StreamPendingResultStatus.Ok, totalCount, smallest, largest, Array.Empty<StreamPendingConsumerInfo>(), entries);
+        }
+
+        private async Task<StreamClaimResult> StreamClaimCoreAsync(string key, string group, string consumer, long minIdleTimeMs, string[] ids, long? idleMs, long? timeMs, long? retryCount, bool force, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsStreamWrongTypeAsync(key, nowUtc, token))
+            {
+                return new StreamClaimResult(StreamClaimResultStatus.WrongType, Array.Empty<StreamEntry>());
+            }
+
+            var doc = await streamCollection.Find(ActiveStreamKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new StreamClaimResult(StreamClaimResultStatus.NoStream, Array.Empty<StreamEntry>());
+            }
+
+            var groupDoc = doc.Groups.FirstOrDefault(x => string.Equals(x.Name, group, StringComparison.Ordinal));
+            if (groupDoc == null)
+            {
+                return new StreamClaimResult(StreamClaimResultStatus.NoGroup, Array.Empty<StreamEntry>());
+            }
+
+            if (ids.Length == 0)
+            {
+                return new StreamClaimResult(StreamClaimResultStatus.Ok, Array.Empty<StreamEntry>());
+            }
+
+            var nowUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            EnsureConsumer(groupDoc, consumer, nowUnixMs);
+
+            var byId = doc.Entries.ToDictionary(x => x.Id, StringComparer.Ordinal);
+            var claimed = new List<StreamEntry>();
+
+            for (int i = 0; i < ids.Length; i++)
+            {
+                var id = ids[i];
+                if (!TryParseStreamId(id, out _, out _))
+                {
+                    continue;
+                }
+
+                if (!byId.TryGetValue(id, out var entryDoc))
+                {
+                    continue;
+                }
+
+                var pending = groupDoc.Pending.FirstOrDefault(x => string.Equals(x.Id, id, StringComparison.Ordinal));
+                if (pending == null)
+                {
+                    if (!force)
+                    {
+                        continue;
+                    }
+
+                    pending = new StreamPendingDocument
+                    {
+                        Id = id,
+                        Consumer = consumer,
+                        LastDeliveryUnixMs = nowUnixMs,
+                        DeliveryCount = retryCount.HasValue && retryCount.Value >= 0 ? retryCount.Value : 1
+                    };
+                    groupDoc.Pending.Add(pending);
+                }
+                else
+                {
+                    var idle = Math.Max(0, nowUnixMs - pending.LastDeliveryUnixMs);
+                    if (idle < minIdleTimeMs)
+                    {
+                        continue;
+                    }
+
+                    pending.Consumer = consumer;
+                    pending.DeliveryCount = retryCount.HasValue && retryCount.Value >= 0 ? retryCount.Value : pending.DeliveryCount + 1;
+                }
+
+                if (timeMs.HasValue)
+                {
+                    pending.LastDeliveryUnixMs = timeMs.Value;
+                }
+                else if (idleMs.HasValue)
+                {
+                    pending.LastDeliveryUnixMs = nowUnixMs - idleMs.Value;
+                }
+                else
+                {
+                    pending.LastDeliveryUnixMs = nowUnixMs;
+                }
+
+                claimed.Add(ToStreamEntry(entryDoc));
+            }
+
+            await streamCollection.ReplaceOneAsync(Builders<StreamDocument>.Filter.Eq(x => x.Id, doc.Id), doc, new ReplaceOptions(), token);
+            return new StreamClaimResult(StreamClaimResultStatus.Ok, claimed.ToArray());
         }
 
         private async Task<SetCountResult> SetAddCoreAsync(string key, byte[][] members, CancellationToken token)

@@ -41,6 +41,13 @@ This package currently implements the following `IKeyValueStore` areas:
   - `ZRANGEBYSCORE`, `ZINCRBY`, `ZCOUNT`
   - `ZRANK`, `ZREVRANK`, `ZREMRANGEBYSCORE`
 
+- **Streams**
+  - `XADD`, `XDEL`, `XLEN`, `XTRIM`, `XRANGE`, `XREVRANGE`, `XREAD`
+  - `XINFO STREAM`, `XINFO GROUPS`, `XINFO CONSUMERS`
+  - `XSETID`
+  - `XGROUP CREATE`, `XGROUP DESTROY`, `XGROUP SETID`, `XGROUP DELCONSUMER`
+  - `XREADGROUP`, `XACK`, `XPENDING`, `XCLAIM`
+
 ## Quick start
 
 ```csharp
@@ -55,11 +62,21 @@ await store.SetAsync("hello", System.Text.Encoding.UTF8.GetBytes("world"), null,
 var value = await store.GetAsync("hello");
 ```
 
+## Configuration
+
+`MongoKeyValueStore` constructor:
+
+- `mongoClient`: configured `MongoClient` instance
+- `databaseName` (default: `dredis`)
+- `collectionName` (default: `kvstore`)
+
+The `collectionName` value is used as a prefix for type-specific collections (for example: `kvstore_hash`, `kvstore_list`, `kvstore_set`, `kvstore_zset`).
+
 ## Notes
 
-- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set values.
+- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
-- Remaining `IKeyValueStore` areas (Streams, JSON, Probabilistic structures, Vector, TimeSeries, TopK, TDigest, etc.) are still pending.
+- Remaining `IKeyValueStore` areas (JSON, Probabilistic structures, Vector, TimeSeries, TopK, TDigest, etc.) are still pending.
 
 ## Third-party notice
 
