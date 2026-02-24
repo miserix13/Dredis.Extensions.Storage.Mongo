@@ -16,6 +16,7 @@ namespace Dredis.Extensions.Storage.Mongo
     private readonly IMongoCollection<SetDocument> setCollection;
     private readonly IMongoCollection<SortedSetDocument> sortedSetCollection;
     private readonly IMongoCollection<StreamDocument> streamCollection;
+    private readonly IMongoCollection<HyperLogLogDocument> hyperLogLogCollection;
 
         public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis", string collectionName = "kvstore") : base()
         {
@@ -26,6 +27,7 @@ namespace Dredis.Extensions.Storage.Mongo
             this.setCollection = this.database.GetCollection<SetDocument>($"{collectionName ?? "kvstore"}_set");
             this.sortedSetCollection = this.database.GetCollection<SortedSetDocument>($"{collectionName ?? "kvstore"}_zset");
             this.streamCollection = this.database.GetCollection<StreamDocument>($"{collectionName ?? "kvstore"}_stream");
+            this.hyperLogLogCollection = this.database.GetCollection<HyperLogLogDocument>($"{collectionName ?? "kvstore"}_hll");
 
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -51,6 +53,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var streamKeyIndexModel = new CreateIndexModel<StreamDocument>(streamKeyIndexKeys, new CreateIndexOptions { Unique = true });
             this.streamCollection.Indexes.CreateOne(streamKeyIndexModel);
 
+            var hllKeyIndexKeys = Builders<HyperLogLogDocument>.IndexKeys.Ascending(x => x.Key);
+            var hllKeyIndexModel = new CreateIndexModel<HyperLogLogDocument>(hllKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.hyperLogLogCollection.Indexes.CreateOne(hllKeyIndexModel);
+
             // Ensure TTL index on ExpireAt
             var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
@@ -75,6 +81,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var streamTtlIndexKeys = Builders<StreamDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var streamTtlIndexModel = new CreateIndexModel<StreamDocument>(streamTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.streamCollection.Indexes.CreateOne(streamTtlIndexModel);
+
+            var hllTtlIndexKeys = Builders<HyperLogLogDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var hllTtlIndexModel = new CreateIndexModel<HyperLogLogDocument>(hllTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.hyperLogLogCollection.Indexes.CreateOne(hllTtlIndexModel);
         }
 
         private class KeyValueDocument
@@ -182,6 +192,20 @@ namespace Dredis.Extensions.Storage.Mongo
             public long DeliveryCount { get; set; }
         }
 
+        private class HyperLogLogMemberDocument
+        {
+            public string MemberKey { get; set; } = null!;
+            public byte[] Member { get; set; } = null!;
+        }
+
+        private class HyperLogLogDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public List<HyperLogLogMemberDocument> Members { get; set; } = new();
+            public DateTime? ExpireAt { get; set; }
+        }
+
         private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
 
         private static FilterDefinition<KeyValueDocument> ActiveFilter(DateTime nowUtc) =>
@@ -267,6 +291,21 @@ namespace Dredis.Extensions.Storage.Mongo
                 Builders<StreamDocument>.Filter.In(x => x.Key, keys),
                 ActiveStreamFilter(nowUtc));
 
+        private FilterDefinition<HyperLogLogDocument> HyperLogLogKeyFilter(string key) => Builders<HyperLogLogDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<HyperLogLogDocument> ActiveHyperLogLogFilter(DateTime nowUtc) =>
+            Builders<HyperLogLogDocument>.Filter.Or(
+                Builders<HyperLogLogDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<HyperLogLogDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<HyperLogLogDocument> ActiveHyperLogLogKeyFilter(string key, DateTime nowUtc) =>
+            Builders<HyperLogLogDocument>.Filter.And(HyperLogLogKeyFilter(key), ActiveHyperLogLogFilter(nowUtc));
+
+        private FilterDefinition<HyperLogLogDocument> ActiveHyperLogLogKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<HyperLogLogDocument>.Filter.And(
+                Builders<HyperLogLogDocument>.Filter.In(x => x.Key, keys),
+                ActiveHyperLogLogFilter(nowUtc));
+
         private FilterDefinition<HashDocument> ActiveHashKeysFilter(string[] keys, DateTime nowUtc) =>
             Builders<HashDocument>.Filter.And(
                 Builders<HashDocument>.Filter.In(x => x.Key, keys),
@@ -342,7 +381,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var sortedSetResult = await sortedSetCollection.DeleteManyAsync(sortedSetFilter, token);
             var streamFilter = Builders<StreamDocument>.Filter.In(x => x.Key, keys);
             var streamResult = await streamCollection.DeleteManyAsync(streamFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount;
+            var hllFilter = Builders<HyperLogLogDocument>.Filter.In(x => x.Key, keys);
+            var hllResult = await hyperLogLogCollection.DeleteManyAsync(hllFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -379,7 +420,13 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var streamCount = await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token);
-            return streamCount > 0;
+            if (streamCount > 0)
+            {
+                return true;
+            }
+
+            var hllCount = await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token);
+            return hllCount > 0;
         }
 
         public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
@@ -428,6 +475,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var hllKeys = await hyperLogLogCollection.Find(ActiveHyperLogLogKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in hllKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -443,6 +496,7 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await setCollection.DeleteOneAsync(ActiveSetKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await sortedSetCollection.DeleteOneAsync(ActiveSortedSetKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await streamCollection.DeleteOneAsync(ActiveStreamKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await hyperLogLogCollection.DeleteOneAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -491,7 +545,15 @@ namespace Dredis.Extensions.Storage.Mongo
             var streamFilter = ActiveStreamKeyFilter(key, nowUtc);
             var streamUpdate = Builders<StreamDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var streamResult = await streamCollection.UpdateOneAsync(streamFilter, streamUpdate, null, token);
-            return streamResult.MatchedCount > 0;
+            if (streamResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var hllFilter = ActiveHyperLogLogKeyFilter(key, nowUtc);
+            var hllUpdate = Builders<HyperLogLogDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var hllResult = await hyperLogLogCollection.UpdateOneAsync(hllFilter, hllUpdate, null, token);
+            return hllResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -591,17 +653,17 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<HyperLogLogAddResult> HyperLogLogAddAsync(string key, byte[][] elements, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return HyperLogLogAddCoreAsync(key, elements, token);
         }
 
         public Task<HyperLogLogCountResult> HyperLogLogCountAsync(string[] keys, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return HyperLogLogCountCoreAsync(keys, token);
         }
 
         public Task<HyperLogLogMergeResult> HyperLogLogMergeAsync(string destinationKey, string[] sourceKeys, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return HyperLogLogMergeCoreAsync(destinationKey, sourceKeys, token);
         }
 
         public Task<long?> IncrByAsync(string key, long delta, CancellationToken token = default)
@@ -1084,7 +1146,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var sortedSetResult = await sortedSetCollection.DeleteManyAsync(sortedSetFilter, token);
             var streamFilter = Builders<StreamDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
             var streamResult = await streamCollection.DeleteManyAsync(streamFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount;
+            var hllFilter = Builders<HyperLogLogDocument>.Filter.Lte(x => x.ExpireAt, nowUtc);
+            var hllResult = await hyperLogLogCollection.DeleteManyAsync(hllFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount;
         }
 
         private async Task<byte[]?[]> GetManyCoreAsync(string[] keys, CancellationToken token)
@@ -1237,6 +1301,23 @@ namespace Dredis.Extensions.Storage.Mongo
                 return (long)(streamDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
             }
 
+            var hllDoc = await hyperLogLogCollection.Find(HyperLogLogKeyFilter(key)).FirstOrDefaultAsync(token);
+            if (hllDoc != null)
+            {
+                if (!hllDoc.ExpireAt.HasValue)
+                {
+                    return -1;
+                }
+
+                if (hllDoc.ExpireAt.Value <= nowUtc)
+                {
+                    await hyperLogLogCollection.DeleteOneAsync(HyperLogLogKeyFilter(key), token);
+                    return -2;
+                }
+
+                return (long)(hllDoc.ExpireAt.Value - nowUtc).TotalMilliseconds;
+            }
+
             return -2;
         }
 
@@ -1258,7 +1339,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0 ||
                 await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0 ||
                 await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0 ||
-                await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+                await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0 ||
+                await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1461,7 +1543,13 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             var streamCount = await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token);
-            return streamCount > 0;
+            if (streamCount > 0)
+            {
+                return true;
+            }
+
+            var hllCount = await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token);
+            return hllCount > 0;
         }
 
         private static string ToMemberKey(byte[] member) => Convert.ToBase64String(member);
@@ -1496,6 +1584,11 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
             return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
         }
 
@@ -1517,6 +1610,11 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return true;
             }
@@ -1642,7 +1740,211 @@ namespace Dredis.Extensions.Storage.Mongo
                 return true;
             }
 
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
             return await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsHyperLogLogWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<HyperLogLogAddResult> HyperLogLogAddCoreAsync(string key, byte[][] elements, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsHyperLogLogWrongTypeAsync(key, nowUtc, token))
+            {
+                return new HyperLogLogAddResult(HyperLogLogResultStatus.WrongType, false);
+            }
+
+            if (elements.Length == 0)
+            {
+                return new HyperLogLogAddResult(HyperLogLogResultStatus.Ok, false);
+            }
+
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                nowUtc = DateTime.UtcNow;
+                var doc = await hyperLogLogCollection.Find(ActiveHyperLogLogKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    try
+                    {
+                        var unique = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+                        for (int i = 0; i < elements.Length; i++)
+                        {
+                            unique[ToMemberKey(elements[i])] = elements[i];
+                        }
+
+                        var created = new HyperLogLogDocument
+                        {
+                            Key = key,
+                            ExpireAt = null,
+                            Members = unique.Select(x => new HyperLogLogMemberDocument { MemberKey = x.Key, Member = x.Value }).ToList()
+                        };
+
+                        await hyperLogLogCollection.InsertOneAsync(created, null, token);
+                        return new HyperLogLogAddResult(HyperLogLogResultStatus.Ok, created.Members.Count > 0);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        continue;
+                    }
+                }
+
+                var existing = new HashSet<string>(doc.Members.Select(x => x.MemberKey), StringComparer.Ordinal);
+                var changed = false;
+                for (int i = 0; i < elements.Length; i++)
+                {
+                    var memberKey = ToMemberKey(elements[i]);
+                    if (existing.Add(memberKey))
+                    {
+                        doc.Members.Add(new HyperLogLogMemberDocument { MemberKey = memberKey, Member = elements[i] });
+                        changed = true;
+                    }
+                }
+
+                if (!changed)
+                {
+                    return new HyperLogLogAddResult(HyperLogLogResultStatus.Ok, false);
+                }
+
+                var replace = await hyperLogLogCollection.ReplaceOneAsync(
+                    Builders<HyperLogLogDocument>.Filter.Eq(x => x.Id, doc.Id),
+                    doc,
+                    new ReplaceOptions(),
+                    token);
+                if (replace.MatchedCount > 0)
+                {
+                    return new HyperLogLogAddResult(HyperLogLogResultStatus.Ok, true);
+                }
+            }
+
+            return new HyperLogLogAddResult(HyperLogLogResultStatus.Ok, false);
+        }
+
+        private async Task<HyperLogLogCountResult> HyperLogLogCountCoreAsync(string[] keys, CancellationToken token)
+        {
+            if (keys.Length == 0)
+            {
+                return new HyperLogLogCountResult(HyperLogLogResultStatus.Ok, 0);
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            var allMembers = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < keys.Length; i++)
+            {
+                var key = keys[i];
+                if (await IsHyperLogLogWrongTypeAsync(key, nowUtc, token))
+                {
+                    return new HyperLogLogCountResult(HyperLogLogResultStatus.WrongType, 0);
+                }
+
+                var doc = await hyperLogLogCollection.Find(ActiveHyperLogLogKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null)
+                {
+                    continue;
+                }
+
+                for (int memberIndex = 0; memberIndex < doc.Members.Count; memberIndex++)
+                {
+                    allMembers.Add(doc.Members[memberIndex].MemberKey);
+                }
+            }
+
+            return new HyperLogLogCountResult(HyperLogLogResultStatus.Ok, allMembers.Count);
+        }
+
+        private async Task<HyperLogLogMergeResult> HyperLogLogMergeCoreAsync(string destinationKey, string[] sourceKeys, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsHyperLogLogWrongTypeAsync(destinationKey, nowUtc, token))
+            {
+                return new HyperLogLogMergeResult(HyperLogLogResultStatus.WrongType);
+            }
+
+            var merged = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            for (int i = 0; i < sourceKeys.Length; i++)
+            {
+                var key = sourceKeys[i];
+                if (await IsHyperLogLogWrongTypeAsync(key, nowUtc, token))
+                {
+                    return new HyperLogLogMergeResult(HyperLogLogResultStatus.WrongType);
+                }
+
+                var source = await hyperLogLogCollection.Find(ActiveHyperLogLogKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                if (source == null)
+                {
+                    continue;
+                }
+
+                for (int memberIndex = 0; memberIndex < source.Members.Count; memberIndex++)
+                {
+                    var member = source.Members[memberIndex];
+                    merged[member.MemberKey] = member.Member;
+                }
+            }
+
+            var destination = await hyperLogLogCollection.Find(ActiveHyperLogLogKeyFilter(destinationKey, nowUtc)).FirstOrDefaultAsync(token);
+            if (destination == null)
+            {
+                var created = new HyperLogLogDocument
+                {
+                    Key = destinationKey,
+                    ExpireAt = null,
+                    Members = merged.Select(x => new HyperLogLogMemberDocument { MemberKey = x.Key, Member = x.Value }).ToList()
+                };
+
+                try
+                {
+                    await hyperLogLogCollection.InsertOneAsync(created, null, token);
+                }
+                catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                {
+                    destination = await hyperLogLogCollection.Find(ActiveHyperLogLogKeyFilter(destinationKey, nowUtc)).FirstOrDefaultAsync(token);
+                    if (destination != null)
+                    {
+                        destination.Members = merged.Select(x => new HyperLogLogMemberDocument { MemberKey = x.Key, Member = x.Value }).ToList();
+                        await hyperLogLogCollection.ReplaceOneAsync(Builders<HyperLogLogDocument>.Filter.Eq(x => x.Id, destination.Id), destination, new ReplaceOptions(), token);
+                    }
+                }
+
+                return new HyperLogLogMergeResult(HyperLogLogResultStatus.Ok);
+            }
+
+            destination.Members = merged.Select(x => new HyperLogLogMemberDocument { MemberKey = x.Key, Member = x.Value }).ToList();
+            await hyperLogLogCollection.ReplaceOneAsync(Builders<HyperLogLogDocument>.Filter.Eq(x => x.Id, destination.Id), destination, new ReplaceOptions(), token);
+            return new HyperLogLogMergeResult(HyperLogLogResultStatus.Ok);
         }
 
         private async Task<string?> StreamAddCoreAsync(string key, string id, KeyValuePair<string, byte[]>[] fields, CancellationToken token)
