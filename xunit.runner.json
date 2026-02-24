@@ -1,0 +1,9 @@
+{
+  "parallelizeTestCollections": true,
+  "maxParallelThreads": 4,
+  "testDiscovery": {
+    "include": [
+      "Dredis.Extensions.Storage.Mongo.Tests.dll"
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'Dredis.Extensions.Storage.Mongo.Tests'">
+    <BaseIntermediateOutputPath>obj\Tests\</BaseIntermediateOutputPath>
+    <BaseOutputPath>bin\Tests\</BaseOutputPath>
+  </PropertyGroup>
+</Project>
