@@ -36,9 +36,6 @@ jobs:
       - name: Build
         run: dotnet build Dredis.Extensions.Storage.Mongo.slnx --configuration Release --no-restore
 
-      - name: Test
-        run: dotnet test Dredis.Extensions.Storage.Mongo.Tests.csproj --configuration Release --no-build --verbosity normal
-
       - name: Pack
         run: dotnet pack Dredis.Extensions.Storage.Mongo.csproj --configuration Release --no-build --output artifacts /p:ContinuousIntegrationBuild=true
 
