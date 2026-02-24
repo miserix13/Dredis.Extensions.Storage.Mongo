@@ -4,6 +4,8 @@ using MongoDB.Driver;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace Dredis.Extensions.Storage.Mongo
 {
@@ -12,6 +14,7 @@ namespace Dredis.Extensions.Storage.Mongo
 
         private readonly IMongoDatabase database;
         private readonly IMongoCollection<KeyValueDocument> collection;
+    private readonly IMongoCollection<JsonDocument> jsonCollection;
     private readonly IMongoCollection<HashDocument> hashCollection;
     private readonly IMongoCollection<ListDocument> listCollection;
     private readonly IMongoCollection<SetDocument> setCollection;
@@ -29,6 +32,7 @@ namespace Dredis.Extensions.Storage.Mongo
         {
             this.database = mongoClient.GetDatabase(databaseName);
             this.collection = this.database.GetCollection<KeyValueDocument>(collectionName ?? "kvstore");
+            this.jsonCollection = this.database.GetCollection<JsonDocument>($"{collectionName ?? "kvstore"}_json");
             this.hashCollection = this.database.GetCollection<HashDocument>($"{collectionName ?? "kvstore"}_hash");
             this.listCollection = this.database.GetCollection<ListDocument>($"{collectionName ?? "kvstore"}_list");
             this.setCollection = this.database.GetCollection<SetDocument>($"{collectionName ?? "kvstore"}_set");
@@ -45,6 +49,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var keyIndexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.Key);
             var keyIndexModel = new CreateIndexModel<KeyValueDocument>(keyIndexKeys, new CreateIndexOptions { Unique = true });
             this.collection.Indexes.CreateOne(keyIndexModel);
+
+            var jsonKeyIndexKeys = Builders<JsonDocument>.IndexKeys.Ascending(x => x.Key);
+            var jsonKeyIndexModel = new CreateIndexModel<JsonDocument>(jsonKeyIndexKeys, new CreateIndexOptions { Unique = true });
+            this.jsonCollection.Indexes.CreateOne(jsonKeyIndexModel);
 
             var hashKeyIndexKeys = Builders<HashDocument>.IndexKeys.Ascending(x => x.Key);
             var hashKeyIndexModel = new CreateIndexModel<HashDocument>(hashKeyIndexKeys, new CreateIndexOptions { Unique = true });
@@ -99,6 +107,10 @@ namespace Dredis.Extensions.Storage.Mongo
             var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.collection.Indexes.CreateOne(indexModel);
 
+            var jsonTtlIndexKeys = Builders<JsonDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var jsonTtlIndexModel = new CreateIndexModel<JsonDocument>(jsonTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            this.jsonCollection.Indexes.CreateOne(jsonTtlIndexModel);
+
             var hashTtlIndexKeys = Builders<HashDocument>.IndexKeys.Ascending(x => x.ExpireAt);
             var hashTtlIndexModel = new CreateIndexModel<HashDocument>(hashTtlIndexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
             this.hashCollection.Indexes.CreateOne(hashTtlIndexModel);
@@ -149,6 +161,14 @@ namespace Dredis.Extensions.Storage.Mongo
         }
 
         private class KeyValueDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public byte[] Value { get; set; } = null!;
+            public DateTime? ExpireAt { get; set; }
+        }
+
+        private class JsonDocument
         {
             public ObjectId Id { get; set; }
             public string Key { get; set; } = null!;
@@ -369,6 +389,21 @@ namespace Dredis.Extensions.Storage.Mongo
             Builders<KeyValueDocument>.Filter.And(
                 Builders<KeyValueDocument>.Filter.In(x => x.Key, keys),
                 ActiveFilter(nowUtc));
+
+        private FilterDefinition<JsonDocument> JsonKeyFilter(string key) => Builders<JsonDocument>.Filter.Eq(x => x.Key, key);
+
+        private static FilterDefinition<JsonDocument> ActiveJsonFilter(DateTime nowUtc) =>
+            Builders<JsonDocument>.Filter.Or(
+                Builders<JsonDocument>.Filter.Eq(x => x.ExpireAt, (DateTime?)null),
+                Builders<JsonDocument>.Filter.Gt(x => x.ExpireAt, nowUtc));
+
+        private FilterDefinition<JsonDocument> ActiveJsonKeyFilter(string key, DateTime nowUtc) =>
+            Builders<JsonDocument>.Filter.And(JsonKeyFilter(key), ActiveJsonFilter(nowUtc));
+
+        private FilterDefinition<JsonDocument> ActiveJsonKeysFilter(string[] keys, DateTime nowUtc) =>
+            Builders<JsonDocument>.Filter.And(
+                Builders<JsonDocument>.Filter.In(x => x.Key, keys),
+                ActiveJsonFilter(nowUtc));
 
         private FilterDefinition<HashDocument> HashKeyFilter(string key) => Builders<HashDocument>.Filter.Eq(x => x.Key, key);
 
@@ -634,7 +669,9 @@ namespace Dredis.Extensions.Storage.Mongo
             var vectorResult = await vectorCollection.DeleteManyAsync(vectorFilter, token);
             var timeseriesFilter = Builders<TimeSeriesDocument>.Filter.In(x => x.Key, keys);
             var timeseriesResult = await timeSeriesCollection.DeleteManyAsync(timeseriesFilter, token);
-            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount + timeseriesResult.DeletedCount;
+            var jsonFilter = Builders<JsonDocument>.Filter.In(x => x.Key, keys);
+            var jsonResult = await jsonCollection.DeleteManyAsync(jsonFilter, token);
+            return result.DeletedCount + hashResult.DeletedCount + listResult.DeletedCount + setResult.DeletedCount + sortedSetResult.DeletedCount + streamResult.DeletedCount + hllResult.DeletedCount + bloomResult.DeletedCount + cuckooResult.DeletedCount + tdigestResult.DeletedCount + topkResult.DeletedCount + vectorResult.DeletedCount + timeseriesResult.DeletedCount + jsonResult.DeletedCount;
         }
 
         public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
@@ -708,6 +745,12 @@ namespace Dredis.Extensions.Storage.Mongo
 
             var vectorCount = await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token);
             if (vectorCount > 0)
+            {
+                return true;
+            }
+
+            var jsonCount = await jsonCollection.CountDocumentsAsync(ActiveJsonKeyFilter(key, nowUtc), null, token);
+            if (jsonCount > 0)
             {
                 return true;
             }
@@ -803,6 +846,12 @@ namespace Dredis.Extensions.Storage.Mongo
                 keySet.Add(item);
             }
 
+            var jsonKeys = await jsonCollection.Find(ActiveJsonKeysFilter(keys, nowUtc)).Project(x => x.Key).ToListAsync(token);
+            foreach (var item in jsonKeys)
+            {
+                keySet.Add(item);
+            }
+
             return keySet.Count;
         }
 
@@ -825,6 +874,7 @@ namespace Dredis.Extensions.Storage.Mongo
                 deleted += (await topKCollection.DeleteOneAsync(ActiveTopKKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await vectorCollection.DeleteOneAsync(ActiveVectorKeyFilter(key, nowUtc), token)).DeletedCount;
                 deleted += (await timeSeriesCollection.DeleteOneAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), token)).DeletedCount;
+                deleted += (await jsonCollection.DeleteOneAsync(ActiveJsonKeyFilter(key, nowUtc), token)).DeletedCount;
                 return deleted > 0;
             }
 
@@ -929,7 +979,15 @@ namespace Dredis.Extensions.Storage.Mongo
             var timeseriesFilter = ActiveTimeSeriesKeyFilter(key, nowUtc);
             var timeseriesUpdate = Builders<TimeSeriesDocument>.Update.Set(x => x.ExpireAt, expireAt);
             var timeseriesResult = await timeSeriesCollection.UpdateOneAsync(timeseriesFilter, timeseriesUpdate, null, token);
-            return timeseriesResult.MatchedCount > 0;
+            if (timeseriesResult.MatchedCount > 0)
+            {
+                return true;
+            }
+
+            var jsonFilter = ActiveJsonKeyFilter(key, nowUtc);
+            var jsonUpdate = Builders<JsonDocument>.Update.Set(x => x.ExpireAt, expireAt);
+            var jsonResult = await jsonCollection.UpdateOneAsync(jsonFilter, jsonUpdate, null, token);
+            return jsonResult.MatchedCount > 0;
         }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
@@ -1049,62 +1107,62 @@ namespace Dredis.Extensions.Storage.Mongo
 
         public Task<JsonArrayResult> JsonArrappendAsync(string key, string path, byte[][] values, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonArrappendCoreAsync(key, path, values, token);
         }
 
         public Task<JsonGetResult> JsonArrindexAsync(string key, string path, byte[] value, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonArrindexCoreAsync(key, path, value, token);
         }
 
         public Task<JsonArrayResult> JsonArrinsertAsync(string key, string path, int index, byte[][] values, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonArrinsertCoreAsync(key, path, index, values, token);
         }
 
         public Task<JsonArrayResult> JsonArrlenAsync(string key, string[] paths, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonArrlenCoreAsync(key, paths, token);
         }
 
         public Task<JsonArrayResult> JsonArrremAsync(string key, string path, int? index, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonArrremCoreAsync(key, path, index, token);
         }
 
         public Task<JsonArrayResult> JsonArrtrimAsync(string key, string path, int start, int stop, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonArrtrimCoreAsync(key, path, start, stop, token);
         }
 
         public Task<JsonDelResult> JsonDelAsync(string key, string[] paths, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonDelCoreAsync(key, paths, token);
         }
 
         public Task<JsonGetResult> JsonGetAsync(string key, string[] paths, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonGetCoreAsync(key, paths, token);
         }
 
         public Task<JsonMGetResult> JsonMgetAsync(string[] keys, string path, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonMgetCoreAsync(keys, path, token);
         }
 
         public Task<JsonSetResult> JsonSetAsync(string key, string path, byte[] value, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonSetCoreAsync(key, path, value, token);
         }
 
         public Task<JsonArrayResult> JsonStrlenAsync(string key, string[] paths, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonStrlenCoreAsync(key, paths, token);
         }
 
         public Task<JsonTypeResult> JsonTypeAsync(string key, string[] paths, CancellationToken token = default)
         {
-            throw new NotImplementedException();
+            return JsonTypeCoreAsync(key, paths, token);
         }
 
         public Task<ListIndexResult> ListIndexAsync(string key, int index, CancellationToken token = default)
@@ -1836,7 +1894,8 @@ namespace Dredis.Extensions.Storage.Mongo
                 await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0 ||
                 await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0 ||
                 await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0 ||
-                await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0)
+                await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0 ||
+                await jsonCollection.CountDocumentsAsync(ActiveJsonKeyFilter(key, nowUtc), null, token) > 0)
             {
                 return null;
             }
@@ -1892,6 +1951,977 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             return null;
+        }
+
+        private sealed class JsonPathPart
+        {
+            public string? PropertyName { get; set; }
+            public int? Index { get; set; }
+            public bool IsWildcard { get; set; }
+        }
+
+        private static bool TryParseJsonPath(string path, bool allowWildcard, out List<JsonPathPart> parts)
+        {
+            parts = new List<JsonPathPart>();
+            if (string.IsNullOrWhiteSpace(path) || !path.StartsWith('$'))
+            {
+                return false;
+            }
+
+            var current = 1;
+            while (current < path.Length)
+            {
+                if (path[current] == '.')
+                {
+                    current++;
+                    if (current >= path.Length)
+                    {
+                        return false;
+                    }
+
+                    if (path[current] == '*')
+                    {
+                        if (!allowWildcard)
+                        {
+                            return false;
+                        }
+
+                        parts.Add(new JsonPathPart { IsWildcard = true });
+                        current++;
+                        continue;
+                    }
+
+                    var keyStart = current;
+                    while (current < path.Length && path[current] != '.' && path[current] != '[')
+                    {
+                        current++;
+                    }
+
+                    var key = path.Substring(keyStart, current - keyStart);
+                    if (string.IsNullOrWhiteSpace(key))
+                    {
+                        return false;
+                    }
+
+                    parts.Add(new JsonPathPart { PropertyName = key });
+                    continue;
+                }
+
+                if (path[current] == '[')
+                {
+                    current++;
+                    var indexStart = current;
+                    while (current < path.Length && path[current] != ']')
+                    {
+                        current++;
+                    }
+
+                    if (current >= path.Length || current == indexStart)
+                    {
+                        return false;
+                    }
+
+                    var indexText = path.Substring(indexStart, current - indexStart);
+                    if (indexText == "*")
+                    {
+                        if (!allowWildcard)
+                        {
+                            return false;
+                        }
+
+                        parts.Add(new JsonPathPart { IsWildcard = true });
+                    }
+                    else
+                    {
+                        if (!int.TryParse(indexText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
+                        {
+                            return false;
+                        }
+
+                        parts.Add(new JsonPathPart { Index = index });
+                    }
+
+                    current++;
+                    continue;
+                }
+
+                return false;
+            }
+
+            return true;
+        }
+
+        private static int NormalizeJsonArrayIndex(int index, int length)
+        {
+            return index < 0 ? length + index : index;
+        }
+
+        private static List<JsonNode?> GetJsonNodesAtPath(JsonNode? root, IReadOnlyList<JsonPathPart> parts)
+        {
+            if (root == null)
+            {
+                return new List<JsonNode?>();
+            }
+
+            var candidates = new List<JsonNode?> { root };
+            for (int i = 0; i < parts.Count; i++)
+            {
+                var part = parts[i];
+                var next = new List<JsonNode?>();
+                foreach (var candidate in candidates)
+                {
+                    if (candidate == null)
+                    {
+                        continue;
+                    }
+
+                    if (part.IsWildcard)
+                    {
+                        if (candidate is JsonObject obj)
+                        {
+                            foreach (var item in obj)
+                            {
+                                next.Add(item.Value);
+                            }
+                        }
+                        else if (candidate is JsonArray arr)
+                        {
+                            for (var j = 0; j < arr.Count; j++)
+                            {
+                                next.Add(arr[j]);
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    if (part.PropertyName != null)
+                    {
+                        if (candidate is JsonObject objectNode && objectNode.TryGetPropertyValue(part.PropertyName, out var propertyValue))
+                        {
+                            next.Add(propertyValue);
+                        }
+
+                        continue;
+                    }
+
+                    if (part.Index.HasValue && candidate is JsonArray arrayNode)
+                    {
+                        var normalizedIndex = NormalizeJsonArrayIndex(part.Index.Value, arrayNode.Count);
+                        if (normalizedIndex >= 0 && normalizedIndex < arrayNode.Count)
+                        {
+                            next.Add(arrayNode[normalizedIndex]);
+                        }
+                    }
+                }
+
+                candidates = next;
+                if (candidates.Count == 0)
+                {
+                    break;
+                }
+            }
+
+            return candidates;
+        }
+
+        private static bool TryGetJsonNodeAtPath(JsonNode? root, IReadOnlyList<JsonPathPart> parts, out JsonNode? node)
+        {
+            node = root;
+            if (node == null)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < parts.Count; i++)
+            {
+                var part = parts[i];
+                if (part.IsWildcard)
+                {
+                    return false;
+                }
+
+                if (part.PropertyName != null)
+                {
+                    if (node is not JsonObject objectNode || !objectNode.TryGetPropertyValue(part.PropertyName, out var propertyValue))
+                    {
+                        node = null;
+                        return false;
+                    }
+
+                    node = propertyValue;
+                    continue;
+                }
+
+                if (!part.Index.HasValue || node is not JsonArray arrayNode)
+                {
+                    node = null;
+                    return false;
+                }
+
+                var normalizedIndex = NormalizeJsonArrayIndex(part.Index.Value, arrayNode.Count);
+                if (normalizedIndex < 0 || normalizedIndex >= arrayNode.Count)
+                {
+                    node = null;
+                    return false;
+                }
+
+                node = arrayNode[normalizedIndex];
+            }
+
+            return true;
+        }
+
+        private static bool TryParseJsonNode(byte[] value, out JsonNode? node)
+        {
+            try
+            {
+                node = JsonNode.Parse(value);
+                return node != null;
+            }
+            catch
+            {
+                node = null;
+                return false;
+            }
+        }
+
+        private static byte[] SerializeJsonNode(JsonNode? node)
+        {
+            return JsonSerializer.SerializeToUtf8Bytes(node);
+        }
+
+        private static string GetJsonTypeName(JsonNode? node)
+        {
+            if (node == null)
+            {
+                return "null";
+            }
+
+            if (node is JsonObject)
+            {
+                return "object";
+            }
+
+            if (node is JsonArray)
+            {
+                return "array";
+            }
+
+            var element = node.GetValue<JsonElement>();
+            return element.ValueKind switch
+            {
+                JsonValueKind.String => "string",
+                JsonValueKind.Number => "number",
+                JsonValueKind.True => "boolean",
+                JsonValueKind.False => "boolean",
+                JsonValueKind.Null => "null",
+                JsonValueKind.Object => "object",
+                JsonValueKind.Array => "array",
+                _ => "null"
+            };
+        }
+
+        private static long GetJsonStringLength(JsonNode? node)
+        {
+            if (node == null)
+            {
+                return 0;
+            }
+
+            var element = node.GetValue<JsonElement>();
+            return element.ValueKind == JsonValueKind.String ? (element.GetString()?.Length ?? 0) : 0;
+        }
+
+        private static long GetJsonArrayLength(JsonNode? node)
+        {
+            return node is JsonArray arr ? arr.Count : 0;
+        }
+
+        private static byte[] SerializeJsonNodeMatches(List<JsonNode?> nodes)
+        {
+            if (nodes.Count == 0)
+            {
+                return Encoding.UTF8.GetBytes("null");
+            }
+
+            if (nodes.Count == 1)
+            {
+                return SerializeJsonNode(nodes[0]);
+            }
+
+            var multi = new JsonArray();
+            foreach (var node in nodes)
+            {
+                multi.Add(node?.DeepClone());
+            }
+
+            return SerializeJsonNode(multi);
+        }
+
+        private async Task<JsonSetResult> JsonSetCoreAsync(string key, string path, byte[] value, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonSetResult(JsonResultStatus.WrongType);
+            }
+
+            if (!TryParseJsonNode(value, out var inputNode))
+            {
+                return new JsonSetResult(JsonResultStatus.InvalidJson);
+            }
+
+            if (!TryParseJsonPath(path, allowWildcard: false, out var parts))
+            {
+                return new JsonSetResult(JsonResultStatus.InvalidPath);
+            }
+
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                if (path != "$")
+                {
+                    return new JsonSetResult(JsonResultStatus.PathNotFound);
+                }
+
+                try
+                {
+                    await jsonCollection.InsertOneAsync(new JsonDocument
+                    {
+                        Key = key,
+                        Value = SerializeJsonNode(inputNode),
+                        ExpireAt = null
+                    }, null, token);
+
+                    return new JsonSetResult(JsonResultStatus.Ok, created: true);
+                }
+                catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                {
+                    doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+                    if (doc == null)
+                    {
+                        return new JsonSetResult(JsonResultStatus.PathNotFound);
+                    }
+                }
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode))
+            {
+                return new JsonSetResult(JsonResultStatus.InvalidJson);
+            }
+
+            if (path == "$")
+            {
+                rootNode = inputNode;
+            }
+            else
+            {
+                var parentParts = parts.Take(parts.Count - 1).ToList();
+                var lastPart = parts[^1];
+                if (lastPart.IsWildcard)
+                {
+                    return new JsonSetResult(JsonResultStatus.InvalidPath);
+                }
+
+                if (!TryGetJsonNodeAtPath(rootNode, parentParts, out var parentNode) || parentNode == null)
+                {
+                    return new JsonSetResult(JsonResultStatus.PathNotFound);
+                }
+
+                var nodeToSet = inputNode?.DeepClone();
+                if (lastPart.PropertyName != null)
+                {
+                    if (parentNode is not JsonObject objectNode)
+                    {
+                        return new JsonSetResult(JsonResultStatus.PathNotFound);
+                    }
+
+                    objectNode[lastPart.PropertyName] = nodeToSet;
+                }
+                else if (lastPart.Index.HasValue)
+                {
+                    if (parentNode is not JsonArray arrayNode)
+                    {
+                        return new JsonSetResult(JsonResultStatus.PathNotFound);
+                    }
+
+                    var normalizedIndex = NormalizeJsonArrayIndex(lastPart.Index.Value, arrayNode.Count);
+                    if (normalizedIndex < 0 || normalizedIndex >= arrayNode.Count)
+                    {
+                        return new JsonSetResult(JsonResultStatus.PathNotFound);
+                    }
+
+                    arrayNode[normalizedIndex] = nodeToSet;
+                }
+                else
+                {
+                    return new JsonSetResult(JsonResultStatus.InvalidPath);
+                }
+            }
+
+            var update = Builders<JsonDocument>.Update.Set(x => x.Value, SerializeJsonNode(rootNode));
+            var updateResult = await jsonCollection.UpdateOneAsync(
+                Builders<JsonDocument>.Filter.Eq(x => x.Id, doc.Id),
+                update,
+                null,
+                token);
+
+            return updateResult.MatchedCount > 0
+                ? new JsonSetResult(JsonResultStatus.Ok)
+                : new JsonSetResult(JsonResultStatus.PathNotFound);
+        }
+
+        private async Task<JsonGetResult> JsonGetCoreAsync(string key, string[] paths, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonGetResult(JsonResultStatus.WrongType);
+            }
+
+            var effectivePaths = paths.Length == 0 ? new[] { "$" } : paths;
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonGetResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode))
+            {
+                return new JsonGetResult(JsonResultStatus.InvalidJson);
+            }
+
+            if (effectivePaths.Length == 1)
+            {
+                if (!TryParseJsonPath(effectivePaths[0], allowWildcard: true, out var parts))
+                {
+                    return new JsonGetResult(JsonResultStatus.InvalidPath);
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                if (matches.Count == 0)
+                {
+                    return new JsonGetResult(JsonResultStatus.PathNotFound);
+                }
+
+                return new JsonGetResult(JsonResultStatus.Ok, value: SerializeJsonNodeMatches(matches));
+            }
+
+            var values = new byte[effectivePaths.Length][];
+            for (var i = 0; i < effectivePaths.Length; i++)
+            {
+                if (!TryParseJsonPath(effectivePaths[i], allowWildcard: true, out var parts))
+                {
+                    return new JsonGetResult(JsonResultStatus.InvalidPath);
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                values[i] = SerializeJsonNodeMatches(matches);
+            }
+
+            return new JsonGetResult(JsonResultStatus.Ok, values: values);
+        }
+
+        private async Task<JsonDelResult> JsonDelCoreAsync(string key, string[] paths, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonDelResult(JsonResultStatus.WrongType);
+            }
+
+            var effectivePaths = paths.Length == 0 ? new[] { "$" } : paths;
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonDelResult(JsonResultStatus.Ok, 0);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode))
+            {
+                return new JsonDelResult(JsonResultStatus.InvalidJson);
+            }
+
+            long deleted = 0;
+            var deleteRoot = false;
+
+            foreach (var path in effectivePaths)
+            {
+                if (!TryParseJsonPath(path, allowWildcard: false, out var parts))
+                {
+                    return new JsonDelResult(JsonResultStatus.InvalidPath);
+                }
+
+                if (path == "$")
+                {
+                    deleteRoot = true;
+                    deleted++;
+                    break;
+                }
+
+                var parentParts = parts.Take(parts.Count - 1).ToList();
+                var lastPart = parts[^1];
+                if (!TryGetJsonNodeAtPath(rootNode, parentParts, out var parentNode) || parentNode == null)
+                {
+                    continue;
+                }
+
+                if (lastPart.PropertyName != null && parentNode is JsonObject objectNode)
+                {
+                    if (objectNode.Remove(lastPart.PropertyName))
+                    {
+                        deleted++;
+                    }
+
+                    continue;
+                }
+
+                if (lastPart.Index.HasValue && parentNode is JsonArray arrayNode)
+                {
+                    var normalizedIndex = NormalizeJsonArrayIndex(lastPart.Index.Value, arrayNode.Count);
+                    if (normalizedIndex >= 0 && normalizedIndex < arrayNode.Count)
+                    {
+                        arrayNode.RemoveAt(normalizedIndex);
+                        deleted++;
+                    }
+                }
+            }
+
+            if (deleteRoot)
+            {
+                await jsonCollection.DeleteOneAsync(JsonKeyFilter(key), token);
+                return new JsonDelResult(JsonResultStatus.Ok, deleted);
+            }
+
+            if (deleted > 0)
+            {
+                var update = Builders<JsonDocument>.Update.Set(x => x.Value, SerializeJsonNode(rootNode));
+                await jsonCollection.UpdateOneAsync(Builders<JsonDocument>.Filter.Eq(x => x.Id, doc.Id), update, null, token);
+            }
+
+            return new JsonDelResult(JsonResultStatus.Ok, deleted);
+        }
+
+        private async Task<JsonTypeResult> JsonTypeCoreAsync(string key, string[] paths, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonTypeResult(JsonResultStatus.WrongType);
+            }
+
+            var effectivePaths = paths.Length == 0 ? new[] { "$" } : paths;
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonTypeResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode))
+            {
+                return new JsonTypeResult(JsonResultStatus.InvalidJson);
+            }
+
+            var types = new string[effectivePaths.Length];
+            for (var i = 0; i < effectivePaths.Length; i++)
+            {
+                if (!TryParseJsonPath(effectivePaths[i], allowWildcard: true, out var parts))
+                {
+                    return new JsonTypeResult(JsonResultStatus.InvalidPath);
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                types[i] = matches.Count == 0 ? "null" : GetJsonTypeName(matches[0]);
+            }
+
+            return new JsonTypeResult(JsonResultStatus.Ok, types);
+        }
+
+        private async Task<JsonArrayResult> JsonStrlenCoreAsync(string key, string[] paths, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonArrayResult(JsonResultStatus.WrongType);
+            }
+
+            var effectivePaths = paths.Length == 0 ? new[] { "$" } : paths;
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode))
+            {
+                return new JsonArrayResult(JsonResultStatus.InvalidJson);
+            }
+
+            if (effectivePaths.Length == 1)
+            {
+                if (!TryParseJsonPath(effectivePaths[0], allowWildcard: true, out var parts))
+                {
+                    return new JsonArrayResult(JsonResultStatus.InvalidPath);
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                var value = matches.Count == 0 ? 0 : GetJsonStringLength(matches[0]);
+                return new JsonArrayResult(JsonResultStatus.Ok, count: value);
+            }
+
+            var counts = new long[effectivePaths.Length];
+            for (var i = 0; i < effectivePaths.Length; i++)
+            {
+                if (!TryParseJsonPath(effectivePaths[i], allowWildcard: true, out var parts))
+                {
+                    return new JsonArrayResult(JsonResultStatus.InvalidPath);
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                counts[i] = matches.Count == 0 ? 0 : GetJsonStringLength(matches[0]);
+            }
+
+            return new JsonArrayResult(JsonResultStatus.Ok, counts: counts);
+        }
+
+        private async Task<JsonArrayResult> JsonArrlenCoreAsync(string key, string[] paths, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonArrayResult(JsonResultStatus.WrongType);
+            }
+
+            var effectivePaths = paths.Length == 0 ? new[] { "$" } : paths;
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode))
+            {
+                return new JsonArrayResult(JsonResultStatus.InvalidJson);
+            }
+
+            if (effectivePaths.Length == 1)
+            {
+                if (!TryParseJsonPath(effectivePaths[0], allowWildcard: true, out var parts))
+                {
+                    return new JsonArrayResult(JsonResultStatus.InvalidPath);
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                var value = matches.Count == 0 ? 0 : GetJsonArrayLength(matches[0]);
+                return new JsonArrayResult(JsonResultStatus.Ok, count: value);
+            }
+
+            var counts = new long[effectivePaths.Length];
+            for (var i = 0; i < effectivePaths.Length; i++)
+            {
+                if (!TryParseJsonPath(effectivePaths[i], allowWildcard: true, out var parts))
+                {
+                    return new JsonArrayResult(JsonResultStatus.InvalidPath);
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                counts[i] = matches.Count == 0 ? 0 : GetJsonArrayLength(matches[0]);
+            }
+
+            return new JsonArrayResult(JsonResultStatus.Ok, counts: counts);
+        }
+
+        private async Task<JsonArrayResult> JsonArrappendCoreAsync(string key, string path, byte[][] values, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonArrayResult(JsonResultStatus.WrongType);
+            }
+
+            if (!TryParseJsonPath(path, allowWildcard: false, out var parts))
+            {
+                return new JsonArrayResult(JsonResultStatus.InvalidPath);
+            }
+
+            var valueNodes = new List<JsonNode?>(values.Length);
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (!TryParseJsonNode(values[i], out var parsedNode))
+                {
+                    return new JsonArrayResult(JsonResultStatus.InvalidJson);
+                }
+
+                valueNodes.Add(parsedNode);
+            }
+
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode) || !TryGetJsonNodeAtPath(rootNode, parts, out var targetNode) || targetNode is not JsonArray arrayNode)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            foreach (var valueNode in valueNodes)
+            {
+                arrayNode.Add(valueNode?.DeepClone());
+            }
+
+            await jsonCollection.UpdateOneAsync(
+                Builders<JsonDocument>.Filter.Eq(x => x.Id, doc.Id),
+                Builders<JsonDocument>.Update.Set(x => x.Value, SerializeJsonNode(rootNode)),
+                null,
+                token);
+
+            return new JsonArrayResult(JsonResultStatus.Ok, count: arrayNode.Count);
+        }
+
+        private async Task<JsonGetResult> JsonArrindexCoreAsync(string key, string path, byte[] value, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonGetResult(JsonResultStatus.WrongType);
+            }
+
+            if (!TryParseJsonPath(path, allowWildcard: false, out var parts))
+            {
+                return new JsonGetResult(JsonResultStatus.InvalidPath);
+            }
+
+            if (!TryParseJsonNode(value, out var searchNode))
+            {
+                return new JsonGetResult(JsonResultStatus.InvalidJson);
+            }
+
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonGetResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode) || !TryGetJsonNodeAtPath(rootNode, parts, out var targetNode) || targetNode is not JsonArray arrayNode)
+            {
+                return new JsonGetResult(JsonResultStatus.PathNotFound);
+            }
+
+            var foundIndex = -1;
+            for (var i = 0; i < arrayNode.Count; i++)
+            {
+                if (JsonNode.DeepEquals(arrayNode[i], searchNode))
+                {
+                    foundIndex = i;
+                    break;
+                }
+            }
+
+            return new JsonGetResult(JsonResultStatus.Ok, value: Encoding.UTF8.GetBytes(foundIndex.ToString(CultureInfo.InvariantCulture)));
+        }
+
+        private async Task<JsonArrayResult> JsonArrinsertCoreAsync(string key, string path, int index, byte[][] values, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonArrayResult(JsonResultStatus.WrongType);
+            }
+
+            if (!TryParseJsonPath(path, allowWildcard: false, out var parts))
+            {
+                return new JsonArrayResult(JsonResultStatus.InvalidPath);
+            }
+
+            var valueNodes = new List<JsonNode?>(values.Length);
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (!TryParseJsonNode(values[i], out var parsedNode))
+                {
+                    return new JsonArrayResult(JsonResultStatus.InvalidJson);
+                }
+
+                valueNodes.Add(parsedNode);
+            }
+
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode) || !TryGetJsonNodeAtPath(rootNode, parts, out var targetNode) || targetNode is not JsonArray arrayNode)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            var insertionIndex = index;
+            if (insertionIndex < 0)
+            {
+                insertionIndex = arrayNode.Count + insertionIndex;
+            }
+
+            insertionIndex = Math.Max(0, Math.Min(arrayNode.Count, insertionIndex));
+            for (var i = 0; i < valueNodes.Count; i++)
+            {
+                arrayNode.Insert(insertionIndex + i, valueNodes[i]?.DeepClone());
+            }
+
+            await jsonCollection.UpdateOneAsync(
+                Builders<JsonDocument>.Filter.Eq(x => x.Id, doc.Id),
+                Builders<JsonDocument>.Update.Set(x => x.Value, SerializeJsonNode(rootNode)),
+                null,
+                token);
+
+            return new JsonArrayResult(JsonResultStatus.Ok, count: arrayNode.Count);
+        }
+
+        private async Task<JsonArrayResult> JsonArrremCoreAsync(string key, string path, int? index, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonArrayResult(JsonResultStatus.WrongType);
+            }
+
+            if (!TryParseJsonPath(path, allowWildcard: false, out var parts))
+            {
+                return new JsonArrayResult(JsonResultStatus.InvalidPath);
+            }
+
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode) || !TryGetJsonNodeAtPath(rootNode, parts, out var targetNode) || targetNode is not JsonArray arrayNode)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (arrayNode.Count > 0)
+            {
+                if (index.HasValue)
+                {
+                    var normalizedIndex = NormalizeJsonArrayIndex(index.Value, arrayNode.Count);
+                    if (normalizedIndex >= 0 && normalizedIndex < arrayNode.Count)
+                    {
+                        arrayNode.RemoveAt(normalizedIndex);
+                    }
+                }
+                else
+                {
+                    arrayNode.RemoveAt(arrayNode.Count - 1);
+                }
+            }
+
+            await jsonCollection.UpdateOneAsync(
+                Builders<JsonDocument>.Filter.Eq(x => x.Id, doc.Id),
+                Builders<JsonDocument>.Update.Set(x => x.Value, SerializeJsonNode(rootNode)),
+                null,
+                token);
+
+            return new JsonArrayResult(JsonResultStatus.Ok, count: arrayNode.Count);
+        }
+
+        private async Task<JsonArrayResult> JsonArrtrimCoreAsync(string key, string path, int start, int stop, CancellationToken token)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (await IsJsonWrongTypeAsync(key, nowUtc, token))
+            {
+                return new JsonArrayResult(JsonResultStatus.WrongType);
+            }
+
+            if (!TryParseJsonPath(path, allowWildcard: false, out var parts))
+            {
+                return new JsonArrayResult(JsonResultStatus.InvalidPath);
+            }
+
+            var doc = await jsonCollection.Find(ActiveJsonKeyFilter(key, nowUtc)).FirstOrDefaultAsync(token);
+            if (doc == null)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            if (!TryParseJsonNode(doc.Value, out var rootNode) || !TryGetJsonNodeAtPath(rootNode, parts, out var targetNode) || targetNode is not JsonArray arrayNode)
+            {
+                return new JsonArrayResult(JsonResultStatus.PathNotFound);
+            }
+
+            var length = arrayNode.Count;
+            if (length == 0)
+            {
+                return new JsonArrayResult(JsonResultStatus.Ok, count: 0);
+            }
+
+            var normalizedStart = start < 0 ? length + start : start;
+            var normalizedStop = stop < 0 ? length + stop : stop;
+            normalizedStart = Math.Max(0, normalizedStart);
+            normalizedStop = Math.Min(length - 1, normalizedStop);
+
+            if (normalizedStart > normalizedStop || normalizedStart >= length)
+            {
+                arrayNode.Clear();
+            }
+            else
+            {
+                for (var i = length - 1; i > normalizedStop; i--)
+                {
+                    arrayNode.RemoveAt(i);
+                }
+
+                for (var i = normalizedStart - 1; i >= 0; i--)
+                {
+                    arrayNode.RemoveAt(i);
+                }
+            }
+
+            await jsonCollection.UpdateOneAsync(
+                Builders<JsonDocument>.Filter.Eq(x => x.Id, doc.Id),
+                Builders<JsonDocument>.Update.Set(x => x.Value, SerializeJsonNode(rootNode)),
+                null,
+                token);
+
+            return new JsonArrayResult(JsonResultStatus.Ok, count: arrayNode.Count);
+        }
+
+        private async Task<JsonMGetResult> JsonMgetCoreAsync(string[] keys, string path, CancellationToken token)
+        {
+            if (!TryParseJsonPath(path, allowWildcard: true, out var parts))
+            {
+                return new JsonMGetResult(JsonResultStatus.InvalidPath);
+            }
+
+            if (keys.Length == 0)
+            {
+                return new JsonMGetResult(JsonResultStatus.Ok, Array.Empty<byte[]>());
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            var values = new byte[keys.Length][];
+            for (var i = 0; i < keys.Length; i++)
+            {
+                if (await IsJsonWrongTypeAsync(keys[i], nowUtc, token))
+                {
+                    return new JsonMGetResult(JsonResultStatus.WrongType);
+                }
+
+                var doc = await jsonCollection.Find(ActiveJsonKeyFilter(keys[i], nowUtc)).FirstOrDefaultAsync(token);
+                if (doc == null || !TryParseJsonNode(doc.Value, out var rootNode))
+                {
+                    values[i] = Encoding.UTF8.GetBytes("null");
+                    continue;
+                }
+
+                var matches = GetJsonNodesAtPath(rootNode, parts);
+                values[i] = SerializeJsonNodeMatches(matches);
+            }
+
+            return new JsonMGetResult(JsonResultStatus.Ok, values);
         }
 
         private async Task<bool> HashSetCoreAsync(string key, string field, byte[] value, CancellationToken token)
@@ -2863,6 +3893,71 @@ namespace Dredis.Extensions.Storage.Mongo
             }
 
             return await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0;
+        }
+
+        private async Task<bool> IsJsonWrongTypeAsync(string key, DateTime nowUtc, CancellationToken token)
+        {
+            if (await collection.CountDocumentsAsync(ActiveKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hashCollection.CountDocumentsAsync(ActiveHashKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await listCollection.CountDocumentsAsync(ActiveListKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await setCollection.CountDocumentsAsync(ActiveSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await sortedSetCollection.CountDocumentsAsync(ActiveSortedSetKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await streamCollection.CountDocumentsAsync(ActiveStreamKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await hyperLogLogCollection.CountDocumentsAsync(ActiveHyperLogLogKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await bloomCollection.CountDocumentsAsync(ActiveBloomKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await cuckooCollection.CountDocumentsAsync(ActiveCuckooKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await tdigestCollection.CountDocumentsAsync(ActiveTDigestKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await topKCollection.CountDocumentsAsync(ActiveTopKKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            if (await vectorCollection.CountDocumentsAsync(ActiveVectorKeyFilter(key, nowUtc), null, token) > 0)
+            {
+                return true;
+            }
+
+            return await timeSeriesCollection.CountDocumentsAsync(ActiveTimeSeriesKeyFilter(key, nowUtc), null, token) > 0;
         }
 
         private async Task<HyperLogLogAddResult> HyperLogLogAddCoreAsync(string key, byte[][] elements, CancellationToken token)
