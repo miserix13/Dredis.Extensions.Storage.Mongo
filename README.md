@@ -57,6 +57,12 @@ This package currently implements the following `IKeyValueStore` areas:
 - **Cuckoo filter**
   - `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`, `CF.EXISTS`, `CF.DEL`, `CF.COUNT`, `CF.INFO`
 
+- **TDigest**
+  - `TDIGEST.CREATE`, `TDIGEST.RESET`, `TDIGEST.ADD`
+  - `TDIGEST.QUANTILE`, `TDIGEST.CDF`
+  - `TDIGEST.RANK`, `TDIGEST.REVRANK`, `TDIGEST.BYRANK`, `TDIGEST.BYREVRANK`
+  - `TDIGEST.TRIMMED_MEAN`, `TDIGEST.MIN`, `TDIGEST.MAX`, `TDIGEST.INFO`
+
 ## Quick start
 
 ```csharp
@@ -83,9 +89,9 @@ The `collectionName` value is used as a prefix for type-specific collections (fo
 
 ## Notes
 
-- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo values.
+- Key-type separation is implemented with dedicated Mongo collections for string/hash/list/set/sorted-set/stream/hyperloglog/bloom/cuckoo/tdigest values.
 - Cross-type key operations (`DEL`, `EXISTS`, `EXPIRE`, `PTTL`, cleanup) account for all currently implemented types.
-- Remaining `IKeyValueStore` areas (JSON, Vector, TimeSeries, TopK, TDigest, etc.) are still pending.
+- Remaining `IKeyValueStore` areas (JSON, Vector, TimeSeries, TopK, etc.) are still pending.
 
 ## Third-party notice
 
