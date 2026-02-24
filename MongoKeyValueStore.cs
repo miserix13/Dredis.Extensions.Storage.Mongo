@@ -6,7 +6,99 @@ namespace Dredis.Extensions.Storage.Mongo
 {
     public class MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis") : IKeyValueStore
     {
-        private readonly MongoClient client = mongoClient;
+
+        private readonly IMongoDatabase database = mongoClient.GetDatabase(databaseName);
+        private readonly IMongoCollection<KeyValueDocument> collection;
+
+        public MongoKeyValueStore(MongoClient mongoClient, string databaseName = "dredis") : this(mongoClient, databaseName, null) { }
+
+        public MongoKeyValueStore(MongoClient mongoClient, string databaseName, string? collectionName = null) : this(mongoClient)
+        {
+            database = mongoClient.GetDatabase(databaseName);
+            collection = database.GetCollection<KeyValueDocument>(collectionName ?? "kvstore");
+            // Ensure TTL index on ExpireAt
+            var indexKeys = Builders<KeyValueDocument>.IndexKeys.Ascending(x => x.ExpireAt);
+            var indexModel = new CreateIndexModel<KeyValueDocument>(indexKeys, new CreateIndexOptions { ExpireAfter = TimeSpan.Zero });
+            collection.Indexes.CreateOne(indexModel);
+        }
+
+        private class KeyValueDocument
+        {
+            public ObjectId Id { get; set; }
+            public string Key { get; set; } = null!;
+            public byte[] Value { get; set; } = null!;
+            public DateTime? ExpireAt { get; set; }
+        }
+
+        private FilterDefinition<KeyValueDocument> KeyFilter(string key) => Builders<KeyValueDocument>.Filter.Eq(x => x.Key, key);
+
+        public async Task<bool> SetAsync(string key, byte[] value, TimeSpan? expiration, SetCondition condition, CancellationToken token = default)
+        {
+            var filter = KeyFilter(key);
+            var update = Builders<KeyValueDocument>.Update
+                .Set(x => x.Value, value)
+                .Set(x => x.Key, key)
+                .Set(x => x.ExpireAt, expiration.HasValue ? DateTime.UtcNow.Add(expiration.Value) : null);
+
+            UpdateOptions options = new() { IsUpsert = true };
+            if (condition == SetCondition.Nx)
+            {
+                // Only insert if not exists
+                var doc = new KeyValueDocument { Key = key, Value = value, ExpireAt = expiration.HasValue ? DateTime.UtcNow.Add(expiration.Value) : null };
+                var result = await collection.InsertOneAsync(doc, null, token);
+                return true;
+            }
+            else if (condition == SetCondition.Xx)
+            {
+                // Only update if exists
+                var updateResult = await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = false }, token);
+                return updateResult.ModifiedCount > 0;
+            }
+            else
+            {
+                // Always upsert
+                var updateResult = await collection.UpdateOneAsync(filter, update, options, token);
+                return updateResult.ModifiedCount > 0 || updateResult.UpsertedId != null;
+            }
+        }
+
+        public async Task<byte[]?> GetAsync(string key, CancellationToken token = default)
+        {
+            var filter = KeyFilter(key);
+            var doc = await collection.Find(filter).FirstOrDefaultAsync(token);
+            if (doc == null || (doc.ExpireAt.HasValue && doc.ExpireAt.Value < DateTime.UtcNow))
+                return null;
+            return doc.Value;
+        }
+
+        public async Task<long> DeleteAsync(string[] keys, CancellationToken token = default)
+        {
+            var filter = Builders<KeyValueDocument>.Filter.In(x => x.Key, keys);
+            var result = await collection.DeleteManyAsync(filter, token);
+            return result.DeletedCount;
+        }
+
+        public async Task<bool> ExistsAsync(string key, CancellationToken token = default)
+        {
+            var filter = KeyFilter(key);
+            var count = await collection.CountDocumentsAsync(filter, null, token);
+            return count > 0;
+        }
+
+        public async Task<long> ExistsAsync(string[] keys, CancellationToken token = default)
+        {
+            var filter = Builders<KeyValueDocument>.Filter.In(x => x.Key, keys);
+            var count = await collection.CountDocumentsAsync(filter, null, token);
+            return count;
+        }
+
+        public async Task<bool> ExpireAsync(string key, TimeSpan expiration, CancellationToken token = default)
+        {
+            var filter = KeyFilter(key);
+            var update = Builders<KeyValueDocument>.Update.Set(x => x.ExpireAt, DateTime.UtcNow.Add(expiration));
+            var result = await collection.UpdateOneAsync(filter, update, null, token);
+            return result.ModifiedCount > 0;
+        }
 
         public Task<ProbabilisticBoolResult> BloomAddAsync(string key, byte[] element, CancellationToken token = default)
         {
